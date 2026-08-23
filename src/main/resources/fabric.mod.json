@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "snapaim",
+  "version": "${version}",
+  "name": "SnapAim",
+  "description": "Aimbot by @snapclient",
+  "authors": ["@snapclient"],
+  "contact": {
+    "telegram": "@snapclient"
+  },
+  "license": "MIT",
+  "icon": "assets/snapaim/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.snapvisual.aim.SnapAimMod"
+    ]
+  },
+  "mixins": [
+    "snapaim.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
