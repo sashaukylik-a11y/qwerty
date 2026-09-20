@@ -123,15 +123,34 @@ static DWORD WINAPI EngineWorker(LPVOID){
     return 0;
 }
 static LRESULT CALLBACK HudProc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_ERASEBKGND)return 1;if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintHudBuffered(dc,ps.rcPaint);EndPaint(h,&ps);return 0;}return DefWindowProcW(h,m,w,l);}
+static void HandleRShiftState(BOOL down){
+    if(down&&!g_rshiftDown)ToggleMenuReliable();
+    g_rshiftDown=down;
+}
+#ifdef MONO_CI_RSHIFT_TEST
+#define WM_MONO_TEST_RSHIFT 0x804E
+static DWORD WINAPI RShiftSelfTestWorker(LPVOID){
+    Sleep(250);
+    SendMessageW(g_main,WM_MONO_TEST_RSHIFT,1,0);SendMessageW(g_main,WM_MONO_TEST_RSHIFT,0,0);
+    Sleep(320);
+    if(!g_menuVisible||g_menuAnimTarget!=1000||g_menuAnim<990)ExitProcess(101);
+    SendMessageW(g_main,WM_MONO_TEST_RSHIFT,1,0);SendMessageW(g_main,WM_MONO_TEST_RSHIFT,0,0);
+    Sleep(320);
+    if(g_menuVisible||g_menuAnimTarget!=0||g_menuAnim!=0)ExitProcess(102);
+    SendMessageW(g_main,WM_MONO_TEST_RSHIFT,1,0);SendMessageW(g_main,WM_MONO_TEST_RSHIFT,0,0);
+    Sleep(320);
+    if(!g_menuVisible||g_menuAnimTarget!=1000||g_menuAnim<990)ExitProcess(103);
+    ExitProcess(0);
+    return 0;
+}
+#endif
 static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
  if(m==WM_ERASEBKGND)return 1;
  if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintMainBuffered(dc);EndPaint(h,&ps);return 0;}
  if(m==WM_TIMER){
     // One authoritative 16 ms RSHIFT edge detector. The hidden window still receives WM_TIMER,
     // so short taps cannot fall into a 100 ms polling gap and there is no worker/timer race.
-    BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
-    if(kd&&!g_rshiftDown)ToggleMenuReliable();
-    g_rshiftDown=kd;
+    HandleRShiftState((GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE);
     TickMenuAnimation();
     static ULONGLONG lastMenuStatus=0,lastHud=0,lastGeom=0;ULONGLONG now=GetTickCount64();
     BOOL animating=(g_menuAnim!=g_menuAnimTarget);
@@ -141,6 +160,9 @@ static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
     if(g_cfg.showHud&&now-lastHud>=1000){lastHud=now;RequestStatusRedraw();}
     return 0;
  }
+#ifdef MONO_CI_RSHIFT_TEST
+ if(m==WM_MONO_TEST_RSHIFT){HandleRShiftState(w?TRUE:FALSE);return 0;}
+#endif
  if(m==WM_MONO_TOGGLE){ToggleMenuReliable();return 0;}
  if(m==WM_KEYDOWN&&w==VK_ESCAPE){if(g_menuVisible&&g_menuAnimTarget>0)CloseMenuReliable();return 0;}
  if(m==WM_RBUTTONDOWN){int x,y;MapMouseToDesign(h,l,&x,&y);int cy=y+g_scroll[g_tab];if(g_tab==0&&x>=228&&x<=870&&cy>=154&&cy<=564){g_triggerExpanded=!g_triggerExpanded;ClampScroll();InvalidateRect(h,0,FALSE);return 0;}}
@@ -196,6 +218,9 @@ extern "C" void WINAPI wWinMainCRTStartup(){
     RECT r;GetClientRect(g_main,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(g_main,rg,TRUE);g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);
     g_rshiftDown=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
     UpdateTopmost();UpdateHudState();
+#ifdef MONO_CI_RSHIFT_TEST
+    DWORD selfTid=0;HANDLE selfThread=CreateThread(0,0,RShiftSelfTestWorker,0,0,&selfTid);if(!selfThread)ExitProcess(100);CloseHandle(selfThread);
+#endif
     DWORD engineTid=0;g_engineStop=0;g_engineThread=CreateThread(0,0,EngineWorker,0,0,&engineTid);
     MSG msg;while(GetMessageW(&msg,0,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);} g_engineStop=1;if(g_engineThread){WaitForSingleObject(g_engineThread,750);CloseHandle(g_engineThread);g_engineThread=0;}if(g_bridgeAttachThread){WaitForSingleObject(g_bridgeAttachThread,4000);CloseHandle(g_bridgeAttachThread);g_bridgeAttachThread=0;}BridgeClose();SaveConfig();ExitProcess(0);
 }
