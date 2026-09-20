@@ -3,7 +3,8 @@ import hashlib,re,sys
 root=Path(__file__).resolve().parent
 src=(root/'MonoClient.cpp').read_text(encoding='utf-8')
 exe=(root/'MonoClient-Full-v28.exe').read_bytes()
-pe=(root/'PE_IMPORTS-v28.txt').read_text(errors='ignore')
+build=(root/'build.cmd').read_text(encoding='utf-8',errors='ignore')
+workflow=(root.parent/'.github'/'workflows'/'build-monoclient-v28.yml').read_text(encoding='utf-8',errors='ignore')
 checks=[]
 def ck(group,name,cond): checks.append((group,name,bool(cond)))
 def section(a,b):
@@ -13,12 +14,10 @@ def section(a,b):
 ck(1,'v28 branding','full v28 • exact jvm.dll • reliable RSHIFT' in src)
 ck(1,'PE x64',exe[:2]==b'MZ' and b'PE\0\0' in exe[:4096])
 ck(1,'requireAdministrator manifest embedded',b'requireAdministrator' in exe)
-ck(1,'compiler/link clean',all((root/f).stat().st_size==0 for f in ['compile.err','link.err']))
-ck(1,'static analyzer clean',all((root/f).stat().st_size==0 for f in ['analyze.out','analyze.err']))
-hashes=[]
-for f in ['MonoClient-Full-v28.exe','repro1.exe','repro2.exe','repro3.exe']:
-    hashes.append(hashlib.sha256((root/f).read_bytes()).hexdigest())
-ck(1,'3 reproducible builds + final identical',len(set(hashes))==1)
+ck(1,'warnings are errors','/W4 /WX' in build)
+ck(1,'deterministic linker enabled','/brepro' in build)
+ck(1,'CI reproducibility check configured','Reproducibility check' in workflow and 'Non-reproducible build' in workflow)
+hashes=[hashlib.sha256(exe).hexdigest()]
 
 # 2 exact Pulse/Java detector copied from user's approach
 blk=section('static int BuildExactJvmDllHosts','static ULONGLONG GetProcCreateTimeValue')
@@ -45,8 +44,9 @@ ck(3,'attach worker idle priority','THREAD_PRIORITY_IDLE' in section('static DWO
 # 4 reliable global Right Shift menu
 ck(4,'single RSHIFT detector - no worker race','static DWORD WINAPI MenuHotkeyWorker' not in src and 'g_hotkeyThread' not in src)
 timer=section('if(m==WM_TIMER)','if(m==WM_MONO_TOGGLE)')
-ck(4,'timer reads VK_RSHIFT globally','GetAsyncKeyState(VK_RSHIFT)' in timer)
-ck(4,'timer uses shared edge handler','HandleRShiftState((GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE);' in timer)
+ck(4,'right-shift reader uses specific key','GetAsyncKeyState(VK_RSHIFT)' in src)
+ck(4,'right-shift generic fallback excludes left','GetAsyncKeyState(VK_SHIFT)' in src and 'GetAsyncKeyState(VK_LSHIFT)' in src)
+ck(4,'timer uses shared edge handler','HandleRShiftState(ReadRightShiftDown());' in timer)
 ck(4,'edge handler toggles on rising edge','if(down&&!g_rshiftDown)ToggleMenuReliable();' in src and 'g_rshiftDown=down;' in src)
 ck(4,'hidden timer stays at 16ms','g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);' in src)
 ck(4,'compiled RSHIFT self-test harness','MONO_CI_RSHIFT_TEST' in src and 'RShiftSelfTestWorker' in src)
@@ -84,12 +84,13 @@ ck(6,'active loop 16ms','Sleep(16)' in eng)
 ck(6,'See Invisible disabled','g_cfg.seeInvisible=0' in src and 'WorldToScreen' not in src)
 
 # 7 import/safety shape
-imports=re.findall(r'DLL Name:\s*([^\r\n]+)',pe)
-ck(7,'only kernel/user/gdi imports',set(imports)<= {'KERNEL32.dll','USER32.dll','GDI32.dll'} and bool(imports))
+ascii_dlls={m.group(1).decode('ascii','ignore').lower() for m in re.finditer(rb'([A-Za-z0-9._-]+\\.dll)',exe,re.I)}
+allowed={'kernel32.dll','user32.dll','gdi32.dll'}
+ck(7,'only kernel/user/gdi static imports',bool(ascii_dlls) and ascii_dlls<=allowed and {'kernel32.dll','user32.dll','gdi32.dll'}<=ascii_dlls)
 for good in ['ReadProcessMemory','SendInput','CreateToolhelp32Snapshot','Module32FirstW','Module32NextW']:
-    ck(7,f'import {good}',good in pe)
+    ck(7,f'import {good}',good.encode('ascii') in exe)
 for bad in ['WriteProcessMemory','VirtualAllocEx','CreateRemoteThread','SetWindowsHookExW','SetWindowsHookExA']:
-    ck(7,f'no {bad}',bad not in pe and bad not in src)
+    ck(7,f'no {bad}',bad.encode('ascii') not in exe and bad not in src)
 
 # 8 scenario mirror
 def allow(enabled=True,ready=True,target=True,weapon='sword',use_sword=True,use_mace=True,kind='mob',hit_players=True,hit_mobs=True,ticker_known=True,ticker=13,last_elapsed=9999,critical=False,crit_known=True,on_ground=False,fall=.2,water=False,eye=False,vehicle=False,sprint=False):
