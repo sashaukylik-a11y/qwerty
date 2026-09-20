@@ -5,5 +5,5 @@ copy /b source-parts\MonoClient.cpp.part00.txt+source-parts\MonoClient.cpp.part0
 if errorlevel 1 exit /b 1
 echo Reconstructed MonoClient.cpp
 echo Expected source SHA-256:
-echo e0f33ff9844a2ab290a5dac4286830f0533d48231c47f414983467b2f929be4e
+echo 84959eb5b21e00d98a9acf150eab12ae03873923adfa77092d63290291f4445a
 certutil -hashfile MonoClient.cpp SHA256
