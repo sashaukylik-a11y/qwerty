@@ -15,8 +15,10 @@ This snapshot was uploaded from the working v28 build.
 - The executable uses a `requireAdministrator` UAC manifest so module enumeration does not silently fail when Pulse/Java is elevated.
 - Right Shift menu opening is independent of the **Поверх окон / Always on top** setting:
   - dedicated 16 ms RSHIFT edge worker;
-  - timer fallback;
-  - 140 ms debounce;
+  - timer fallback runs only if that worker could not be created;
+  - 50 ms duplicate-edge debounce;
+  - opening immediately switches the UI timer to 16 ms and makes the first frame visible;
+  - reopening during the close animation follows the animation target, so the first press is not consumed;
   - opening temporarily raises the menu to TOPMOST before activation;
   - closing restores the configured topmost state and Minecraft focus.
 - Read-only HotSpot fallbacks remain after the exact `jvm.dll` path.
@@ -47,3 +49,5 @@ build.cmd
 See `AUDIT-v28.md`, `PE_IMPORTS-v28.txt` and `SHA256_REPRO-v28.txt`.
 
 The build was statically/reproducibly checked in the development environment. A live Pulse Visual session is not available there, so live in-game attach still has to be confirmed on the target Windows machine.
+
+> Hotfix note: the source parts in this branch differ from the original pre-hotfix v28 executable used for the historical PE/reproducibility report. Rebuild `MonoClient.cpp` before using binary hashes as validation.
