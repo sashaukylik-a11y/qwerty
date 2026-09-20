@@ -29,13 +29,13 @@ jobs:
           $actual = (Get-FileHash .\MonoClient.cpp -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected) { throw "Source SHA mismatch: $actual != $expected" }
 
-      - name: Run source audit
-        shell: powershell
-        run: python .\audit_v28.py
-
       - name: Build x64 EXE
         shell: cmd
         run: build.cmd
+
+      - name: Run source audit
+        shell: powershell
+        run: python .\audit_v28.py
 
       - name: Audit embedded manifest and PE
         shell: powershell
