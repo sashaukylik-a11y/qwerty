@@ -1,49 +1,60 @@
-# MonoClient Full v28 — source snapshot
+# MonoClient Full v28 — audited hotfix
 
 Minecraft 1.21.11 external Win32 x64 client by **MonoClient | @monobrowser**.
 
-This snapshot was uploaded from the working v28 build.
+## Current hotfix
 
-## v28 changes
+- Right Shift is handled by one authoritative UI-thread edge detector.
+- The hidden menu keeps a 16 ms Win32 timer, so short RSHIFT taps are not lost in a 100 ms idle gap.
+- The old dedicated hotkey worker was removed, eliminating worker/timer races.
+- Primary input is `VK_RSHIFT`; a generic `VK_SHIFT` fallback is accepted only when `VK_LSHIFT` is not down.
+- Open/close state follows `g_menuAnimTarget`, so a reopen during the 180 ms close animation is not consumed.
+- Visible menu is temporarily TOPMOST even when persistent **Поверх окон** is disabled; closing restores the configured z-order and game focus.
+- JVM attach continues while TriggerBot is disabled. The toggle gates attacks, not process discovery.
+- The JVM attach worker remains joinable during shutdown.
+- Persisted config values are range-validated before use.
 
-- Pulse/JVM detection follows the exact Toolhelp approach first:
-  1. `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`
-  2. process-name candidates containing `pulse`, `minecraft`, `javaw`, or `java`
-  3. `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)`
-  4. accept a JVM host only when exact `jvm.dll` is loaded.
-- Minecraft window PID and JVM host PID are intentionally separate.
-- The executable uses a `requireAdministrator` UAC manifest so module enumeration does not silently fail when Pulse/Java is elevated.
-- Right Shift menu opening is independent of the **Поверх окон / Always on top** setting:
-  - dedicated 16 ms RSHIFT edge worker;
-  - timer fallback;
-  - 140 ms debounce;
-  - opening temporarily raises the menu to TOPMOST before activation;
-  - closing restores the configured topmost state and Minecraft focus.
-- Read-only HotSpot fallbacks remain after the exact `jvm.dll` path.
-- No `WriteProcessMemory`, `VirtualAllocEx`, `CreateRemoteThread`, or Windows hooks are used.
+## Pulse / JVM discovery
 
-## Source layout
+The primary path enumerates process-name candidates, then accepts a host only when exact `jvm.dll` is found through Toolhelp module enumeration. Window PID and JVM-host PID are intentionally separate. PEB/Ldr and embedded/manual-image HotSpot recovery remain later read-only fallbacks.
 
-The complete monolithic `MonoClient.cpp` is stored losslessly as ordered UTF-8 parts under `source-parts/` because this connector uploads text files individually.
+## Build and validation
 
-On Windows run:
+Reconstruct the monolithic source:
 
 ```bat
 reconstruct-source.cmd
 ```
 
-It recreates `MonoClient.cpp` from the ordered parts.
-
-## Build
-
-Requires LLVM/clang-cl + lld-link and the Windows SDK libraries:
+Build the production x64 GUI executable:
 
 ```bat
 build.cmd
 ```
 
-## Validation
+Build the isolated Right Shift regression binary:
 
-See `AUDIT-v28.md`, `PE_IMPORTS-v28.txt` and `SHA256_REPRO-v28.txt`.
+```bat
+build-rshift-selftest.cmd
+```
 
-The build was statically/reproducibly checked in the development environment. A live Pulse Visual session is not available there, so live in-game attach still has to be confirmed on the target Windows machine.
+GitHub Actions run **35529711631** passed the full pipeline:
+
+- reconstructed source SHA verification;
+- `/W4 /WX` production compile and `/brepro` link;
+- integrated **96/96** audit;
+- PE32+ / embedded `requireAdministrator` validation;
+- Windows startup smoke test;
+- isolated RSHIFT `open → close → reopen` self-test;
+- byte-for-byte reproducibility rebuild;
+- artifact upload.
+
+Production SHA-256: `5bb2c767d0d53ce4a70bbfde053a1332d1dd28894db6b417df9511df2a0e61d2`
+
+Source SHA-256: `d06a9bece235f8e87b5da3c59dd62ecd19eccb48c2afccfbeb598bae6f58a778`
+
+The RSHIFT self-test validates the shared edge handler and menu animation/state transitions inside the compiled Windows binary. A physical key press and live Pulse/JVM attach still need final confirmation on the target machine.
+
+## Import / safety shape
+
+Static PE imports are exactly `KERNEL32.dll`, `USER32.dll`, and `GDI32.dll`. The build contains `ReadProcessMemory`, `SendInput`, and Toolhelp enumeration APIs. It does not contain `WriteProcessMemory`, `VirtualAllocEx`, `CreateRemoteThread`, or `SetWindowsHookEx*`.

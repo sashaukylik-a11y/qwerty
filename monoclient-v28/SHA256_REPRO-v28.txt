@@ -1,4 +1,9 @@
-d6dc2f19f4d90c0fb1fc96aa4143b159d1dbb7242187714113820050a6ac37b0  MonoClient-Full-v28.exe
-d6dc2f19f4d90c0fb1fc96aa4143b159d1dbb7242187714113820050a6ac37b0  repro1.exe
-d6dc2f19f4d90c0fb1fc96aa4143b159d1dbb7242187714113820050a6ac37b0  repro2.exe
-d6dc2f19f4d90c0fb1fc96aa4143b159d1dbb7242187714113820050a6ac37b0  repro3.exe
+CI run: 35529711631
+Source SHA-256:
+d06a9bece235f8e87b5da3c59dd62ecd19eccb48c2afccfbeb598bae6f58a778  MonoClient.cpp
+
+Production reproducibility:
+5bb2c767d0d53ce4a70bbfde053a1332d1dd28894db6b417df9511df2a0e61d2  build-first.exe
+5bb2c767d0d53ce4a70bbfde053a1332d1dd28894db6b417df9511df2a0e61d2  MonoClient-Full-v28.exe
+
+Result: byte-identical /brepro rebuild.

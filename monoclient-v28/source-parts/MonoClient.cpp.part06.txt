@@ -33,18 +33,24 @@ static void UpdateTopmost(){
 }
 static void OpenMenuReliable(){
     if(!g_main)return;
-    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<140)return;g_lastMenuToggleTick=now;
+    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<50)return;g_lastMenuToggleTick=now;
     ReleaseCapture();g_dragSlider=0;g_exitConfirm=FALSE;g_menuVisible=TRUE;
+    // Make the first key press visibly animate immediately.
+    if(g_menuAnim<=0){g_menuAnim=60;ApplyMenuAnimation();}
+    StartMenuAnimation(1000);g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);
     SetWindowPos(g_main,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
-    ShowWindow(g_main,SW_SHOW);SetForegroundWindow(g_main);
-    StartMenuAnimation(1000);InvalidateRect(g_main,0,FALSE);
+    ShowWindow(g_main,SW_SHOW);UpdateWindow(g_main);SetForegroundWindow(g_main);
+    InvalidateRect(g_main,0,FALSE);
 }
 static void CloseMenuReliable(){
     if(!g_main)return;
-    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<140)return;g_lastMenuToggleTick=now;
+    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<50)return;g_lastMenuToggleTick=now;
     ReleaseCapture();g_dragSlider=0;g_exitConfirm=FALSE;StartMenuAnimation(0);
+    g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);
 }
-static void ToggleMenuReliable(){if(g_menuAnimTarget>0||g_menuVisible)CloseMenuReliable();else OpenMenuReliable();}
+// Animation target is the authoritative state. While fading out g_menuVisible stays TRUE
+// until the final frame, so checking it here used to consume the first reopen press.
+static void ToggleMenuReliable(){if(g_menuAnimTarget>0)CloseMenuReliable();else OpenMenuReliable();}
 static void UpdateHudState(){if(!g_hud)return;g_lastHudAlpha=-1;UpdateOverlayGeometry();if(g_hudShown)InvalidateRect(g_hud,0,FALSE);}
 static void SetCustomSlider(int id,int x,int left,int w,int minv,int maxv){if(x<left)x=left;if(x>left+w)x=left+w;int v=minv+(x-left)*(maxv-minv)/w;if(id==14)g_cfg.accentR=v;else if(id==15)g_cfg.accentG=v;else if(id==16)g_cfg.accentB=v;InvalidateRect(g_main,0,FALSE);RequestStatusRedraw();}
 static BOOL EnsureHudBuffer(HDC target,int w,int h){
@@ -96,7 +102,14 @@ static DWORD WINAPI EngineWorker(LPVOID){
         }
 
         BOOL active=(g_target.pid&&GameForeground());
-        if(!g_cfg.triggerEnabled){Sleep(180);continue;}
+
+        // Connection state must not depend on the combat toggle. Previously this early-off path
+        // skipped BridgeEnsure(), so the UI could find the Minecraft window but remain forever at
+        // "JVM PID not selected / candidates 0" until TriggerBot itself was enabled.
+        if(!g_cfg.triggerEnabled){
+            if(g_target.pid&&now-lastIdleAttach>=1000){lastIdleAttach=now;BridgeEnsure();}
+            Sleep(180);continue;
+        }
 
         if(!active){
             // Keep attach asynchronous, but never poll Minecraft state while the game is not foreground.
@@ -110,34 +123,52 @@ static DWORD WINAPI EngineWorker(LPVOID){
     return 0;
 }
 static LRESULT CALLBACK HudProc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_ERASEBKGND)return 1;if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintHudBuffered(dc,ps.rcPaint);EndPaint(h,&ps);return 0;}return DefWindowProcW(h,m,w,l);}
-static DWORD WINAPI MenuHotkeyWorker(LPVOID){
-    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
-    BOOL down=FALSE;
-    while(!g_hotkeyStop){
-        BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
-        if(kd&&!down&&g_main)SendMessageW(g_main,WM_MONO_TOGGLE,0,0);
-        down=kd;Sleep(16);
-    }
+static BOOL ReadRightShiftDown(){
+    if(GetAsyncKeyState(VK_RSHIFT)&0x8000)return TRUE;
+    // Fallback for launchers/remote-input layers that expose only generic VK_SHIFT.
+    // Exclude an actual left-shift press so LSHIFT never becomes the menu hotkey.
+    return ((GetAsyncKeyState(VK_SHIFT)&0x8000)!=0)&&((GetAsyncKeyState(VK_LSHIFT)&0x8000)==0);
+}
+static void HandleRShiftState(BOOL down){
+    if(down&&!g_rshiftDown)ToggleMenuReliable();
+    g_rshiftDown=down;
+}
+#ifdef MONO_CI_RSHIFT_TEST
+#define WM_MONO_TEST_RSHIFT 0x804E
+static DWORD WINAPI RShiftSelfTestWorker(LPVOID){
+    Sleep(250);
+    SendMessageW(g_main,WM_MONO_TEST_RSHIFT,1,0);SendMessageW(g_main,WM_MONO_TEST_RSHIFT,0,0);
+    Sleep(320);
+    if(!g_menuVisible||g_menuAnimTarget!=1000||g_menuAnim<990)ExitProcess(101);
+    SendMessageW(g_main,WM_MONO_TEST_RSHIFT,1,0);SendMessageW(g_main,WM_MONO_TEST_RSHIFT,0,0);
+    Sleep(320);
+    if(g_menuVisible||g_menuAnimTarget!=0||g_menuAnim!=0)ExitProcess(102);
+    SendMessageW(g_main,WM_MONO_TEST_RSHIFT,1,0);SendMessageW(g_main,WM_MONO_TEST_RSHIFT,0,0);
+    Sleep(320);
+    if(!g_menuVisible||g_menuAnimTarget!=1000||g_menuAnim<990)ExitProcess(103);
+    ExitProcess(0);
     return 0;
 }
+#endif
 static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
  if(m==WM_ERASEBKGND)return 1;
  if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintMainBuffered(dc);EndPaint(h,&ps);return 0;}
  if(m==WM_TIMER){
-    // UI-timer polling is a backup for the dedicated global RSHIFT worker.
-    // ToggleMenuReliable debounces both paths so one press cannot toggle twice.
-    BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
-    if(kd&&!g_rshiftDown)ToggleMenuReliable();
-    g_rshiftDown=kd;TickMenuAnimation();
+    // One authoritative 16 ms RSHIFT edge detector. The hidden window still receives WM_TIMER,
+    // so short taps cannot fall into a 100 ms polling gap and there is no worker/timer race.
+    HandleRShiftState(ReadRightShiftDown());
+    TickMenuAnimation();
     static ULONGLONG lastMenuStatus=0,lastHud=0,lastGeom=0;ULONGLONG now=GetTickCount64();
     BOOL animating=(g_menuAnim!=g_menuAnimTarget);
-    UINT wantTimer=animating?16:100;if(wantTimer!=g_uiTimerMs){g_uiTimerMs=wantTimer;SetTimer(h,1,g_uiTimerMs,0);}
     if(g_menuVisible&&animating)InvalidateRect(g_main,0,FALSE);
     else if(g_menuVisible&&now-lastMenuStatus>=1000){lastMenuStatus=now;InvalidateRect(g_main,0,FALSE);}
     if(now-lastGeom>=1000){lastGeom=now;UpdateOverlayGeometry();}
     if(g_cfg.showHud&&now-lastHud>=1000){lastHud=now;RequestStatusRedraw();}
     return 0;
  }
+#ifdef MONO_CI_RSHIFT_TEST
+ if(m==WM_MONO_TEST_RSHIFT){HandleRShiftState(w?TRUE:FALSE);return 0;}
+#endif
  if(m==WM_MONO_TOGGLE){ToggleMenuReliable();return 0;}
  if(m==WM_KEYDOWN&&w==VK_ESCAPE){if(g_menuVisible&&g_menuAnimTarget>0)CloseMenuReliable();return 0;}
  if(m==WM_RBUTTONDOWN){int x,y;MapMouseToDesign(h,l,&x,&y);int cy=y+g_scroll[g_tab];if(g_tab==0&&x>=228&&x<=870&&cy>=154&&cy<=564){g_triggerExpanded=!g_triggerExpanded;ClampScroll();InvalidateRect(h,0,FALSE);return 0;}}
@@ -166,7 +197,7 @@ static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
  if(m==WM_LBUTTONUP&&g_dragSlider){g_dragSlider=0;ReleaseCapture();SaveConfig();return 0;}
  if(m==WM_MOVE){if(g_menuAnim==1000&&g_menuAnimTarget==1000)RememberMenuCenter();return 0;}
  if(m==WM_SIZE){if(g_menuAnim==1000&&g_menuAnimTarget==1000){RECT r;GetClientRect(h,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(h,rg,TRUE);}return 0;}
- if(m==WM_DESTROY){KillTimer(h,1);g_hotkeyStop=1;g_engineStop=1;ReleaseCapture();g_dragSlider=0;if(g_menuDC){SelectObject(g_menuDC,g_menuOld);DeleteObject(g_menuBmp);DeleteDC(g_menuDC);g_menuDC=0;g_menuBmp=0;}if(g_hudDC){SelectObject(g_hudDC,g_hudOld);DeleteObject(g_hudBmp);DeleteDC(g_hudDC);g_hudDC=0;g_hudBmp=0;}ClearBrushCache();if(g_fontTitle)DeleteObject(g_fontTitle);if(g_fontSub)DeleteObject(g_fontSub);if(g_fontBody)DeleteObject(g_fontBody);if(g_fontSmall)DeleteObject(g_fontSmall);if(g_fontMetric)DeleteObject(g_fontMetric);g_fontTitle=g_fontSub=g_fontBody=g_fontSmall=g_fontMetric=0;PostQuitMessage(0);return 0;}
+ if(m==WM_DESTROY){KillTimer(h,1);g_engineStop=1;ReleaseCapture();g_dragSlider=0;if(g_menuDC){SelectObject(g_menuDC,g_menuOld);DeleteObject(g_menuBmp);DeleteDC(g_menuDC);g_menuDC=0;g_menuBmp=0;}if(g_hudDC){SelectObject(g_hudDC,g_hudOld);DeleteObject(g_hudBmp);DeleteDC(g_hudDC);g_hudDC=0;g_hudBmp=0;}ClearBrushCache();if(g_fontTitle)DeleteObject(g_fontTitle);if(g_fontSub)DeleteObject(g_fontSub);if(g_fontBody)DeleteObject(g_fontBody);if(g_fontSmall)DeleteObject(g_fontSmall);if(g_fontMetric)DeleteObject(g_fontMetric);g_fontTitle=g_fontSub=g_fontBody=g_fontSmall=g_fontMetric=0;PostQuitMessage(0);return 0;}
  return DefWindowProcW(h,m,w,l);
 }
 
@@ -190,9 +221,12 @@ extern "C" void WINAPI wWinMainCRTStartup(){
     g_main=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TOPMOST,L"MonoClient.Main",L"MonoClient | @monobrowser",WS_POPUP,x,y,900,600,0,0,inst,0);
     if(!g_main)ExitProcess(2);SetLayeredWindowAttributes(g_main,MENU_KEY,0,LWA_ALPHA|LWA_COLORKEY);
     g_hud=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,L"MonoClient.Hud",L"MonoClient HUD",WS_POPUP,24,24,380,110,0,0,inst,0);
-    RECT r;GetClientRect(g_main,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(g_main,rg,TRUE);g_uiTimerMs=100;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);
+    RECT r;GetClientRect(g_main,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(g_main,rg,TRUE);g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);
+    g_rshiftDown=ReadRightShiftDown();
     UpdateTopmost();UpdateHudState();
-    DWORD hotTid=0;g_hotkeyStop=0;g_hotkeyThread=CreateThread(0,0,MenuHotkeyWorker,0,0,&hotTid);
+#ifdef MONO_CI_RSHIFT_TEST
+    DWORD selfTid=0;HANDLE selfThread=CreateThread(0,0,RShiftSelfTestWorker,0,0,&selfTid);if(!selfThread)ExitProcess(100);CloseHandle(selfThread);
+#endif
     DWORD engineTid=0;g_engineStop=0;g_engineThread=CreateThread(0,0,EngineWorker,0,0,&engineTid);
-    MSG msg;while(GetMessageW(&msg,0,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);} g_hotkeyStop=1;g_engineStop=1;if(g_hotkeyThread){WaitForSingleObject(g_hotkeyThread,300);CloseHandle(g_hotkeyThread);g_hotkeyThread=0;}if(g_engineThread){WaitForSingleObject(g_engineThread,750);CloseHandle(g_engineThread);g_engineThread=0;}BridgeClose();SaveConfig();ExitProcess(0);
+    MSG msg;while(GetMessageW(&msg,0,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);} g_engineStop=1;if(g_engineThread){WaitForSingleObject(g_engineThread,750);CloseHandle(g_engineThread);g_engineThread=0;}if(g_bridgeAttachThread){WaitForSingleObject(g_bridgeAttachThread,4000);CloseHandle(g_bridgeAttachThread);g_bridgeAttachThread=0;}BridgeClose();SaveConfig();ExitProcess(0);
 }

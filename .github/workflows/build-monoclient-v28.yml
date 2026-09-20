@@ -1,0 +1,83 @@
+name: Build MonoClient v28 hotfix
+
+on:
+  push:
+    branches:
+      - fix/v28-rshift-menu
+    paths:
+      - "monoclient-v28/**"
+      - ".github/workflows/build-monoclient-v28.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: monoclient-v28
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct source
+        shell: cmd
+        run: reconstruct-source.cmd
+
+      - name: Verify reconstructed source hash
+        shell: powershell
+        run: |
+          $expected = (Get-Content .\SOURCE_SHA256-v28.txt).Split()[0].ToLowerInvariant()
+          $actual = (Get-FileHash .\MonoClient.cpp -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Source SHA mismatch: $actual != $expected" }
+
+      - name: Build x64 EXE
+        shell: cmd
+        run: build.cmd
+
+      - name: Run source audit
+        shell: powershell
+        run: python .\audit_v28.py
+
+      - name: Audit embedded manifest and PE
+        shell: powershell
+        run: |
+          $bytes = [IO.File]::ReadAllBytes(".\MonoClient-Full-v28.exe")
+          if ($bytes.Length -lt 4096) { throw "EXE unexpectedly small" }
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Missing MZ header" }
+          $ascii = [Text.Encoding]::UTF8.GetString($bytes)
+          if (-not $ascii.Contains("requireAdministrator")) { throw "UAC manifest was not embedded" }
+
+      - name: Smoke launch
+        shell: powershell
+        run: |
+          $p = Start-Process -FilePath ".\MonoClient-Full-v28.exe" -PassThru
+          Start-Sleep -Seconds 4
+          if ($p.HasExited) { throw "MonoClient exited during startup. ExitCode=$($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+
+      - name: Build Right Shift self-test
+        shell: cmd
+        run: build-rshift-selftest.cmd
+
+      - name: Run Right Shift self-test
+        shell: powershell
+        run: |
+          $p = Start-Process -FilePath ".\MonoClient-RSHIFT-selftest.exe" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "RSHIFT self-test failed with exit code $($p.ExitCode)" }
+
+      - name: Reproducibility check
+        shell: powershell
+        run: |
+          Copy-Item .\MonoClient-Full-v28.exe .\build-first.exe
+          cmd /c build.cmd
+          $h1 = (Get-FileHash .\build-first.exe -Algorithm SHA256).Hash
+          $h2 = (Get-FileHash .\MonoClient-Full-v28.exe -Algorithm SHA256).Hash
+          if ($h1 -ne $h2) { throw "Non-reproducible build: $h1 != $h2" }
+          Write-Host "SHA256 $h2"
+
+      - name: Upload audited EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonoClient-Full-v28-AUDITED
+          path: monoclient-v28/MonoClient-Full-v28.exe
+          if-no-files-found: error

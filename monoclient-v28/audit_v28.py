@@ -3,9 +3,48 @@ import hashlib,re,sys
 root=Path(__file__).resolve().parent
 src=(root/'MonoClient.cpp').read_text(encoding='utf-8')
 exe=(root/'MonoClient-Full-v28.exe').read_bytes()
-pe=(root/'PE_IMPORTS-v28.txt').read_text(errors='ignore')
+build=(root/'build.cmd').read_text(encoding='utf-8',errors='ignore')
+workflow=(root.parent/'.github'/'workflows'/'build-monoclient-v28.yml').read_text(encoding='utf-8',errors='ignore')
 checks=[]
 def ck(group,name,cond): checks.append((group,name,bool(cond)))
+
+def pe_import_dlls(data: bytes):
+    def u16(o): return int.from_bytes(data[o:o+2],'little')
+    def u32(o): return int.from_bytes(data[o:o+4],'little')
+    if len(data)<0x100 or data[:2]!=b'MZ': return set()
+    peoff=u32(0x3c)
+    if peoff+24>=len(data) or data[peoff:peoff+4]!=b'PE\0\0': return set()
+    nsec=u16(peoff+6); optsz=u16(peoff+20); opt=peoff+24
+    if u16(opt)!=0x20b: return set()
+    dd=opt+112
+    imp_rva=u32(dd+8); imp_size=u32(dd+12)
+    if not imp_rva or not imp_size: return set()
+    sh=opt+optsz
+    sections=[]
+    for i in range(nsec):
+        o=sh+i*40
+        if o+40>len(data): break
+        vsize=u32(o+8); va=u32(o+12); rawsz=u32(o+16); raw=u32(o+20)
+        sections.append((va,max(vsize,rawsz),raw))
+    def rva_off(rva):
+        for va,span,raw in sections:
+            if va<=rva<va+span:
+                return raw+(rva-va)
+        return None
+    off=rva_off(imp_rva)
+    if off is None: return set()
+    out=set()
+    for _ in range(256):
+        if off+20>len(data): break
+        desc=data[off:off+20]
+        if desc==b'\0'*20: break
+        name_rva=u32(off+12); no=rva_off(name_rva)
+        if no is not None and no<len(data):
+            end=data.find(b'\0',no,min(len(data),no+260))
+            if end!=-1:
+                out.add(data[no:end].decode('ascii','ignore').lower())
+        off+=20
+    return out
 def section(a,b):
     i=src.index(a); j=src.index(b,i+len(a)); return src[i:j]
 
@@ -13,12 +52,10 @@ def section(a,b):
 ck(1,'v28 branding','full v28 • exact jvm.dll • reliable RSHIFT' in src)
 ck(1,'PE x64',exe[:2]==b'MZ' and b'PE\0\0' in exe[:4096])
 ck(1,'requireAdministrator manifest embedded',b'requireAdministrator' in exe)
-ck(1,'compiler/link clean',all((root/f).stat().st_size==0 for f in ['compile.err','link.err']))
-ck(1,'static analyzer clean',all((root/f).stat().st_size==0 for f in ['analyze.out','analyze.err']))
-hashes=[]
-for f in ['MonoClient-Full-v28.exe','repro1.exe','repro2.exe','repro3.exe']:
-    hashes.append(hashlib.sha256((root/f).read_bytes()).hexdigest())
-ck(1,'3 reproducible builds + final identical',len(set(hashes))==1)
+ck(1,'warnings are errors','/W4 /WX' in build)
+ck(1,'deterministic linker enabled','/brepro' in build)
+ck(1,'CI reproducibility check configured','Reproducibility check' in workflow and 'Non-reproducible build' in workflow)
+hashes=[hashlib.sha256(exe).hexdigest()]
 
 # 2 exact Pulse/Java detector copied from user's approach
 blk=section('static int BuildExactJvmDllHosts','static ULONGLONG GetProcCreateTimeValue')
@@ -43,17 +80,21 @@ ck(3,'VMStruct marker fallback','HasHotSpotMarkersRange' in findj)
 ck(3,'attach worker idle priority','THREAD_PRIORITY_IDLE' in section('static DWORD WINAPI BridgeAttachWorker','static BOOL BridgeEnsure'))
 
 # 4 reliable global Right Shift menu
-ck(4,'dedicated RSHIFT worker','static DWORD WINAPI MenuHotkeyWorker' in src)
-worker=section('static DWORD WINAPI MenuHotkeyWorker','static LRESULT CALLBACK MainProc')
-ck(4,'worker reads VK_RSHIFT globally','GetAsyncKeyState(VK_RSHIFT)' in worker)
-ck(4,'worker independent of menu HWND visibility','ShowWindow' not in worker and 'IsWindowVisible' not in worker)
-ck(4,'worker low overhead 16ms sleep','Sleep(16)' in worker)
-ck(4,'custom toggle message','WM_MONO_TOGGLE' in src and 'SendMessageW(g_main,WM_MONO_TOGGLE' in worker)
-ck(4,'timer polling fallback','if(kd&&!g_rshiftDown)ToggleMenuReliable();' in src)
-ck(4,'press debounce','g_lastMenuToggleTick' in src and 'now-g_lastMenuToggleTick<140' in src)
+ck(4,'single RSHIFT detector - no worker race','static DWORD WINAPI MenuHotkeyWorker' not in src and 'g_hotkeyThread' not in src)
+timer=section('if(m==WM_TIMER)','if(m==WM_MONO_TOGGLE)')
+ck(4,'right-shift reader uses specific key','GetAsyncKeyState(VK_RSHIFT)' in src)
+ck(4,'right-shift generic fallback excludes left','GetAsyncKeyState(VK_SHIFT)' in src and 'GetAsyncKeyState(VK_LSHIFT)' in src)
+ck(4,'timer uses shared edge handler','HandleRShiftState(ReadRightShiftDown());' in timer)
+ck(4,'edge handler toggles on rising edge','if(down&&!g_rshiftDown)ToggleMenuReliable();' in src and 'g_rshiftDown=down;' in src)
+ck(4,'hidden timer stays at 16ms','g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);' in src)
+ck(4,'compiled RSHIFT self-test harness','MONO_CI_RSHIFT_TEST' in src and 'RShiftSelfTestWorker' in src)
+ck(4,'no idle 100ms RSHIFT gap','wantTimer=animating?16:100' not in src)
+ck(4,'short duplicate-edge debounce','g_lastMenuToggleTick' in src and 'now-g_lastMenuToggleTick<50' in src)
 ck(4,'visible menu forced topmost even setting off','(g_menuVisible||g_cfg.alwaysOnTop)?HWND_TOPMOST:HWND_NOTOPMOST' in src)
 ck(4,'open path raises before show','SetWindowPos(g_main,HWND_TOPMOST' in section('static void OpenMenuReliable','static void CloseMenuReliable'))
 ck(4,'open path foreground request','SetForegroundWindow(g_main)' in section('static void OpenMenuReliable','static void CloseMenuReliable'))
+ck(4,'open wakes 16ms animation timer','g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);' in section('static void OpenMenuReliable','static void CloseMenuReliable'))
+ck(4,'reopen follows animation target','static void ToggleMenuReliable(){if(g_menuAnimTarget>0)CloseMenuReliable();else OpenMenuReliable();}' in src)
 ck(4,'close releases capture','ReleaseCapture();g_dragSlider=0' in section('static void CloseMenuReliable','static void ToggleMenuReliable'))
 ck(4,'Esc uses reliable close','WM_KEYDOWN&&w==VK_ESCAPE' in src and 'CloseMenuReliable()' in src)
 ck(4,'closing restores configured topmost + game focus','UpdateTopmost();RestoreGameFocus();' in src)
@@ -75,17 +116,19 @@ ck(5,'mace 1.50 threshold','fallDistance<1.50' in trig)
 eng=section('static DWORD WINAPI EngineWorker','static LRESULT CALLBACK HudProc')
 ck(6,'engine below normal','THREAD_PRIORITY_BELOW_NORMAL' in eng)
 ck(6,'disabled sleeps 180ms','Sleep(180)' in eng)
+ck(6,'disabled trigger still attaches JVM','if(!g_cfg.triggerEnabled)' in eng and 'BridgeEnsure();' in eng)
 ck(6,'background sleeps 100ms','Sleep(100)' in eng)
 ck(6,'active loop 16ms','Sleep(16)' in eng)
 ck(6,'See Invisible disabled','g_cfg.seeInvisible=0' in src and 'WorldToScreen' not in src)
 
 # 7 import/safety shape
-imports=re.findall(r'DLL Name:\s*([^\r\n]+)',pe)
-ck(7,'only kernel/user/gdi imports',set(imports)<= {'KERNEL32.dll','USER32.dll','GDI32.dll'} and bool(imports))
+import_dlls=pe_import_dlls(exe)
+allowed={'kernel32.dll','user32.dll','gdi32.dll'}
+ck(7,'only kernel/user/gdi static imports',import_dlls==allowed)
 for good in ['ReadProcessMemory','SendInput','CreateToolhelp32Snapshot','Module32FirstW','Module32NextW']:
-    ck(7,f'import {good}',good in pe)
+    ck(7,f'import {good}',good.encode('ascii') in exe)
 for bad in ['WriteProcessMemory','VirtualAllocEx','CreateRemoteThread','SetWindowsHookExW','SetWindowsHookExA']:
-    ck(7,f'no {bad}',bad not in pe and bad not in src)
+    ck(7,f'no {bad}',bad.encode('ascii') not in exe and bad not in src)
 
 # 8 scenario mirror
 def allow(enabled=True,ready=True,target=True,weapon='sword',use_sword=True,use_mace=True,kind='mob',hit_players=True,hit_mobs=True,ticker_known=True,ticker=13,last_elapsed=9999,critical=False,crit_known=True,on_ground=False,fall=.2,water=False,eye=False,vehicle=False,sprint=False):
