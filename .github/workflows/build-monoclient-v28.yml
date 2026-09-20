@@ -67,7 +67,7 @@ jobs:
             [DllImport("user32.dll", SetLastError=true)]
             public static extern bool GetLayeredWindowAttributes(IntPtr hwnd, out uint crKey, out byte bAlpha, out uint dwFlags);
           }
-"@
+          "@
           function Press-RShift {
             [Win32]::keybd_event(0xA1, 0, 0, [UIntPtr]::Zero)
             Start-Sleep -Milliseconds 70
