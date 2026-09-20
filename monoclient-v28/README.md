@@ -51,3 +51,5 @@ See `AUDIT-v28.md`, `PE_IMPORTS-v28.txt` and `SHA256_REPRO-v28.txt`.
 The build was statically/reproducibly checked in the development environment. A live Pulse Visual session is not available there, so live in-game attach still has to be confirmed on the target Windows machine.
 
 > Hotfix note: the source parts in this branch differ from the original pre-hotfix v28 executable used for the historical PE/reproducibility report. Rebuild `MonoClient.cpp` before using binary hashes as validation.
+
+- Hotfix: JVM/process attach now continues even while TriggerBot is disabled; the toggle gates attacks, not process discovery.
