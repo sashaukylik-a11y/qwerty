@@ -1,0 +1,192 @@
+    U64 st=ReadObjField(player,g_bridge.playerHeld);if(!st)return WPN_NONE;U64 item=ReadObjField(st,g_bridge.stackItem);if(!item)return WPN_NONE;
+    U64 mace=ReadStaticOop(g_bridge.itemsKlass,g_bridge.maceItemField);if(mace&&item==mace)return WPN_MACE;
+    for(int i=0;i<7;i++){U64 sword=ReadStaticOop(g_bridge.itemsKlass,g_bridge.swordItemFields[i]);if(sword&&item==sword)return WPN_SWORD;}
+    return WPN_NONE;
+}
+static BOOL IsSubclassKlassPtr(U64 k,U64 wanted){if(!k||!wanted)return FALSE;for(int i=0;k&&i<64;i++,k=R64(k+g_bridge.klassSuper))if(k==wanted)return TRUE;return FALSE;}
+static TargetKind CurrentTargetKindFromKlass(U64 k){if(!k)return TGT_NONE;if(g_bridge.playerKlass&&IsSubclassKlassPtr(k,g_bridge.playerKlass))return TGT_PLAYER;if(g_bridge.livingKlass&&IsSubclassKlassPtr(k,g_bridge.livingKlass))return TGT_MOB;return TGT_OTHER;}
+static TargetKind CurrentTargetKindCached(U64 t){
+    if(!t)return TGT_NONE;U64 k=ResolveKlass(t);if(!k)return TGT_OTHER;
+    for(int i=0;i<12;i++)if(g_targetKindCache[i].klass==k)return g_targetKindCache[i].kind;
+    TargetKind kind=CurrentTargetKindFromKlass(k);g_targetKindCache[g_targetKindCacheNext].klass=k;g_targetKindCache[g_targetKindCacheNext].kind=kind;g_targetKindCacheNext=(g_targetKindCacheNext+1)%12;return kind;
+}
+static __declspec(noinline) void BridgePoll(){
+    GameSnapshot& next=g_engineNext;memset(&next,0,sizeof(next));
+    if(!BridgeEnsure()){PublishGameSnapshot(next);return;}
+    U64 mc=ReadStaticOop(g_bridge.mcKlass,g_bridge.mcInstance);if(!mc){PublishGameSnapshot(next);return;}
+    U64 screen=ReadObjField(mc,g_bridge.mcScreen),p=ReadObjField(mc,g_bridge.mcPlayer);if(!p){PublishGameSnapshot(next);return;}
+    next.ready=screen?FALSE:TRUE;next.player=p;
+    if(!g_cfg.triggerEnabled||!next.ready){PublishGameSnapshot(next);return;}
+
+    U64 t=ReadObjField(mc,g_bridge.mcTarget);next.target=t;if(!t){PublishGameSnapshot(next);return;}
+    next.targetKind=CurrentTargetKindCached(t);
+    BOOL targetAllowed=(next.targetKind==TGT_PLAYER&&g_cfg.hitPlayers)||(next.targetKind==TGT_MOB&&g_cfg.hitMobs);
+    if(!targetAllowed){PublishGameSnapshot(next);return;}
+
+    next.weapon=CurrentWeapon(p);
+    BOOL weaponAllowed=(next.weapon==WPN_SWORD&&g_cfg.useSword)||(next.weapon==WPN_MACE&&g_cfg.useMace);
+    if(!weaponAllowed){PublishGameSnapshot(next);return;}
+
+    // Expensive timing/critical fields are read only when the vanilla weapon cooldown is almost ready.
+    // During most of the cooldown, target+weapon checks are enough and save cross-process reads.
+    ULONGLONG now=GetTickCount64();const int cd=(next.weapon==WPN_MACE)?1670:625;
+    BOOL nearReady=(g_lastAttackTick==0)||(now-g_lastAttackTick+140ULL>=(ULONGLONG)cd);
+    if(nearReady){
+        next.attackTickerKnown=FALSE; next.attackTicker=-1;
+        if(g_bridge.livingAttackTicker.found){int ticker=0;if(RMem(p+(U64)g_bridge.livingAttackTicker.offset,&ticker,sizeof(ticker))){next.attackTickerKnown=TRUE;next.attackTicker=ticker;}}
+        if(g_cfg.criticalOnly){
+            next.criticalStateKnown=FALSE;
+            U8 ground=0,water=0,eye=0,sharedFlags=0; double fall=0.0;
+            BOOL okGround=g_bridge.entOnGround.found&&RMem(p+(U64)g_bridge.entOnGround.offset,&ground,1);
+            BOOL okFall=g_bridge.entFall.found&&RMem(p+(U64)g_bridge.entFall.offset,&fall,sizeof(fall));
+            BOOL okWater=g_bridge.entWater.found&&RMem(p+(U64)g_bridge.entWater.offset,&water,1);
+            BOOL okEye=g_bridge.entEyeWater.found&&RMem(p+(U64)g_bridge.entEyeWater.offset,&eye,1);
+            BOOL okVehicle=FALSE; U64 vehicle=0;
+            if(g_bridge.entVehicle.found)okVehicle=ReadOopAtChecked(p+(U64)g_bridge.entVehicle.offset,&vehicle);
+            BOOL okFlags=ReadLocalSharedFlags(p,&sharedFlags);
+            if(okGround&&okFall&&okWater&&okEye&&okVehicle&&okFlags&&fall>=0.0&&fall<100000.0){
+                next.onGround=ground?TRUE:FALSE;next.fallDistance=fall;next.touchWater=water?TRUE:FALSE;next.eyeWater=eye?TRUE:FALSE;next.hasVehicle=vehicle?TRUE:FALSE;next.sprinting=(sharedFlags&(1u<<3))?TRUE:FALSE;next.criticalStateKnown=TRUE;
+            }
+        }
+    }
+    PublishGameSnapshot(next);
+}
+static BOOL GameForeground(){
+    HWND f=GetForegroundWindow();if(!f||!g_target.pid||!g_gameWnd)return FALSE;
+    return f==g_gameWnd;
+}
+static BOOL SendLeftClick(){INPUT in[2];memset(in,0,sizeof(in));in[0].type=INPUT_MOUSE;in[0].mi.dwFlags=MOUSEEVENTF_LEFTDOWN;in[1].type=INPUT_MOUSE;in[1].mi.dwFlags=MOUSEEVENTF_LEFTUP;return SendInput(2,in,sizeof(INPUT))==2;}
+
+
+static void SetFont(HDC dc,HFONT f){SelectObject(dc,f);}
+static void Text(HDC dc,int x,int y,int w,int h,const wchar_t* s,COLORREF c,HFONT f,UINT align=DT_LEFT){ SetFont(dc,f);SetTextColor(dc,c);SetBkMode(dc,TRANSPARENT);RECT r={x,y,x+w,y+h};DrawTextW(dc,s,-1,&r,align|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS); }
+static void FillRoundBrush(HDC dc,int x,int y,int w,int h,int rad,HBRUSH b){HGDIOBJ ob=SelectObject(dc,b);HGDIOBJ op=SelectObject(dc,GetStockObject(NULL_PEN));RoundRect(dc,x,y,x+w,y+h,rad,rad);SelectObject(dc,ob);SelectObject(dc,op);}
+static void FillRound(HDC dc,int x,int y,int w,int h,int rad,COLORREF c){HBRUSH b=BrushFor(c);if(b)FillRoundBrush(dc,x,y,w,h,rad,b);}
+static void Toggle(HDC dc,int x,int y,BOOL on){ COLORREF base=on?RGBc(112,126,255):RGBc(52,56,65); FillRound(dc,x,y,42,22,22,base); FillRound(dc,x+(on?21:3),y+3,16,16,16,RGBc(239,241,246)); }
+static void Slider(HDC dc,int x,int y,int w,int value,int minv,int maxv){ FillRound(dc,x,y+7,w,4,4,RGBc(45,49,58)); int fill=(value-minv)*w/(maxv-minv); if(fill<4)fill=4;if(fill>w)fill=w;FillRound(dc,x,y+7,fill,4,4,RGBc(g_cfg.accentR,g_cfg.accentG,g_cfg.accentB));int knob=x+fill-7;FillRound(dc,knob,y,14,18,14,RGBc(225,228,255)); }
+
+static COLORREF Accent(){return RGBc(g_cfg.accentR,g_cfg.accentG,g_cfg.accentB);}
+static BOOL g_triggerExpanded=TRUE,g_exitConfirm=FALSE;
+static int g_tab=0; static int g_overlayW=900,g_overlayH=600;
+static void AToW(const char* a,wchar_t*w,int cap){int i=0;for(;i<cap-1&&a&&a[i];i++)w[i]=(wchar_t)(unsigned char)a[i];w[i]=0;}
+static void TriggerTick(){
+    if(!g_cfg.triggerEnabled||!g_game.ready||!g_game.target)return;
+    if(g_game.weapon==WPN_SWORD&&!g_cfg.useSword)return;if(g_game.weapon==WPN_MACE&&!g_cfg.useMace)return;if(g_game.weapon==WPN_NONE)return;
+    if(g_game.targetKind==TGT_PLAYER&&!g_cfg.hitPlayers)return;if(g_game.targetKind==TGT_MOB&&!g_cfg.hitMobs)return;if(g_game.targetKind!=TGT_PLAYER&&g_game.targetKind!=TGT_MOB)return;
+    ULONGLONG now=GetTickCount64();
+    // Prefer Minecraft's own attackStrengthTicker. Fixed ms is only a conservative fallback when the field is unavailable.
+    if(g_game.attackTickerKnown){const int needTicks=(g_game.weapon==WPN_MACE)?34:13;if(g_game.attackTicker<needTicks)return;}
+    else{const int cd=(g_game.weapon==WPN_MACE)?1670:625;if(g_lastAttackTick&&now-g_lastAttackTick<(ULONGLONG)cd)return;}
+    if(g_cfg.criticalOnly){
+        // No VK_SPACE dependency: falling from a ledge/height works exactly like a normal jump fall.
+        // Fail closed if one of the required read-only state reads was not coherent this sample.
+        if(!g_game.criticalStateKnown)return;
+        if(g_game.onGround||g_game.fallDistance<=0.0||g_game.touchWater||g_game.eyeWater||g_game.hasVehicle||g_game.sprinting)return;
+        if(g_game.weapon==WPN_MACE&&g_game.fallDistance<1.50)return;
+    }
+    if(SendLeftClick()){g_lastAttackTick=now;g_attackCount++;}
+}
+static BOOL RectGood(const RECT&r){return r.right>r.left&&r.bottom>r.top;}
+static void RequestStatusRedraw(){if(!g_hud||!g_cfg.showHud)return;RECT r={0,0,380,110};InvalidateRect(g_hud,&r,FALSE);}
+static void UpdateOverlayGeometry(){
+    if(!g_hud)return;
+    if(!g_cfg.showHud){if(g_hudShown){ShowWindow(g_hud,SW_HIDE);g_hudShown=FALSE;}return;}
+    int x=24,y=24,w=380,h=110;RECT r;if(g_gameWnd&&GetWindowRect(g_gameWnd,&r)){x=r.left+18;y=r.top+18;}
+    BYTE a=(BYTE)(g_cfg.hudAlpha*255/100);if(g_lastHudAlpha!=(int)a){SetLayeredWindowAttributes(g_hud,RGBc(0,0,0),a,LWA_COLORKEY|LWA_ALPHA);g_lastHudAlpha=(int)a;}
+    BOOL changed=(x!=g_lastHudX||y!=g_lastHudY||w!=g_lastHudW||h!=g_lastHudH);g_overlayW=w;g_overlayH=h;
+    if(changed){g_lastHudX=x;g_lastHudY=y;g_lastHudW=w;g_lastHudH=h;SetWindowPos(g_hud,HWND_TOPMOST,x,y,w,h,SWP_NOACTIVATE);InvalidateRect(g_hud,0,FALSE);}
+    if(!g_hudShown){ShowWindow(g_hud,SW_SHOWNOACTIVATE);g_hudShown=TRUE;}
+}
+static int ScrollMaxForTab(int tab){
+    if(tab==0)return g_triggerExpanded?90:0;
+    if(tab==1)return 0;
+    return 135;
+}
+static void ClampScroll(){int m=ScrollMaxForTab(g_tab);if(g_scroll[g_tab]<0)g_scroll[g_tab]=0;if(g_scroll[g_tab]>m)g_scroll[g_tab]=m;}
+static void DrawScrollBar(HDC dc){int max=ScrollMaxForTab(g_tab);if(max<=0)return;int top=154,bottom=566,track=bottom-top;int thumb=track*track/(track+max);if(thumb<72)thumb=72;if(thumb>track)thumb=track;int pos=top+(g_scroll[g_tab]*(track-thumb))/max;FillRound(dc,881,top,3,track,3,RGBc(31,35,43));FillRound(dc,880,pos,5,thumb,5,Accent());}
+static void DrawMain(HDC dc){
+    COLORREF bg=RGBc(8,10,13),panel=RGBc(15,18,23),card=RGBc(21,24,30),text=RGBc(239,241,247),sub=RGBc(137,144,158),accent=Accent(),good=RGBc(92,215,151),bad=RGBc(236,105,112);
+    FillRound(dc,0,0,900,600,20,bg);
+    Text(dc,28,17,250,30,L"MonoClient",text,g_fontTitle);
+    Text(dc,29,48,420,18,L"full v28 • exact jvm.dll • reliable RSHIFT • MonoClient | @monobrowser",sub,g_fontSmall);
+    FillRound(dc,852,18,28,28,14,RGBc(31,35,43));Text(dc,852,16,28,30,L"×",RGBc(190,196,208),g_fontBody,DT_CENTER);
+
+    FillRound(dc,20,83,180,490,16,panel);
+    const wchar_t* tabs[3]={L"Бой",L"Визуал",L"Настройки"};
+    for(int i=0;i<3;i++){int y=106+i*50;FillRound(dc,34,y,152,38,11,i==g_tab?RGBc(28,32,40):RGBc(18,21,27));if(i==g_tab)FillRound(dc,34,y,4,38,4,accent);Text(dc,51,y,120,38,tabs[i],i==g_tab?text:sub,g_fontBody);}
+    Text(dc,38,518,140,18,L"RSHIFT / ESC",sub,g_fontSmall);Text(dc,38,540,140,18,L"закрыть меню",RGBc(104,111,124),g_fontSmall);
+
+    if(g_tab==0){Text(dc,228,91,220,28,L"Бой",text,g_fontMetric);Text(dc,228,120,600,18,L"ЛКМ — включить  •  ПКМ — раскрыть настройки",sub,g_fontSmall);}
+    else if(g_tab==1){Text(dc,228,91,220,28,L"Визуал",text,g_fontMetric);Text(dc,228,120,600,18,L"Только оформление интерфейса — без тяжёлого ESP",sub,g_fontSmall);}
+    else {Text(dc,228,91,220,28,L"Настройки",text,g_fontMetric);Text(dc,228,120,600,18,L"Тема, оверлей и подключение к процессу",sub,g_fontSmall);}
+
+    HRGN clip=CreateRectRgn(214,150,888,574);SelectClipRgn(dc,clip);
+    int o=-g_scroll[g_tab];
+    if(g_tab==0){
+        int y0=154+o;int h0=g_triggerExpanded?410:76;
+        FillRound(dc,228,y0,642,h0,16,panel);
+        Text(dc,250,y0+18,240,22,L"Триггербот",text,g_fontBody);
+        Text(dc,250,y0+41,430,18,g_bridge.state==BR_READY?L"цель берётся из обычного прицела Minecraft":L"ожидание подключения к игровым данным",g_bridge.state==BR_READY?good:sub,g_fontSmall);
+        Toggle(dc,804,y0+22,g_cfg.triggerEnabled);Text(dc,742,y0+23,54,20,g_cfg.triggerEnabled?L"ВКЛ":L"ВЫКЛ",g_cfg.triggerEnabled?good:sub,g_fontSmall,DT_RIGHT);
+        if(g_triggerExpanded){
+            int y=y0+81;struct TRow{const wchar_t*n;int*v;};TRow rr[]={{L"Только критом (реальное падение)",&g_cfg.criticalOnly},{L"Игроки",&g_cfg.hitPlayers},{L"Мобы",&g_cfg.hitMobs},{L"Меч",&g_cfg.useSword},{L"Булава",&g_cfg.useMace}};
+            for(int i=0;i<5;i++){Text(dc,254,y+i*42,255,20,rr[i].n,text,g_fontBody);Toggle(dc,505,y+i*42,*rr[i].v);}
+            FillRound(dc,548,y0+82,292,118,14,card);
+            Text(dc,568,y0+98,230,20,L"Тайминг автоматический",text,g_fontBody);
+            Text(dc,568,y0+128,230,18,L"Меч: 625 мс",sub,g_fontSmall);
+            Text(dc,568,y0+153,230,18,L"Булава: 1670 мс",sub,g_fontSmall);
+            Text(dc,568,y0+177,250,18,L"ручная задержка отключена",sub,g_fontSmall);
+            wchar_t ac[64]=L"Автоударов: ";wchar_t n[24];IntToW(g_attackCount,n,24);WAppend(ac,n,64);Text(dc,548,y0+220,270,18,ac,sub,g_fontSmall);
+            FillRound(dc,250,y0+286,590,92,14,card);
+            Text(dc,270,y0+300,250,20,L"Как работает",text,g_fontBody);
+            Text(dc,270,y0+327,540,18,L"• игроки и мобы распознаются по реальной иерархии классов",sub,g_fontSmall);
+            Text(dc,270,y0+352,540,18,L"• крит определяется по onGround/fallDistance, не по Space",sub,g_fontSmall);
+        }
+        int sy=(g_triggerExpanded?580:246)+o;
+        FillRound(dc,228,sy,642,58,14,card);Text(dc,248,sy+5,440,48,L"Автодетект: Pulse/Java → exact jvm.dll → JVM PID",sub,g_fontSmall);Text(dc,708,sy+5,138,48,g_target.pid?L"ПРОЦЕСС НАЙДЕН":L"ПОИСК",g_target.pid?good:sub,g_fontSmall,DT_RIGHT);
+    } else if(g_tab==1){
+        int y0=154+o;
+        FillRound(dc,228,y0,642,250,16,panel);
+        Text(dc,250,y0+18,300,22,L"Визуал интерфейса",text,g_fontBody);
+        Text(dc,250,y0+44,520,18,L"See Invisible удалён из этой сборки ради максимального FPS",good,g_fontSmall);
+        FillRound(dc,250,y0+82,590,78,14,card);
+        Text(dc,270,y0+98,250,20,L"MonoClient | @monobrowser",text,g_fontBody);
+        Text(dc,270,y0+126,530,18,L"чёрная тема • RGB-акцент • плавное меню • лёгкий HUD",sub,g_fontSmall);
+        FillRound(dc,250,y0+180,590,48,14,card);
+        Text(dc,270,y0+181,540,46,L"Внешний полноэкранный ESP отключён — DWM/GPU не нагружается",sub,g_fontSmall);
+    } else {
+        int y0=154+o;
+        FillRound(dc,228,y0,642,300,16,panel);Text(dc,250,y0+20,200,20,L"RGB-подсветка",text,g_fontBody);const wchar_t* cn[3]={L"Красный",L"Зелёный",L"Синий"};int* cv[3]={&g_cfg.accentR,&g_cfg.accentG,&g_cfg.accentB};for(int i=0;i<3;i++){int y=y0+57+i*58;Text(dc,254,y,80,18,cn[i],sub,g_fontSmall);wchar_t v[16];IntToW(*cv[i],v,16);Text(dc,786,y,55,18,v,sub,g_fontSmall,DT_RIGHT);Slider(dc,334,y+2,430,*cv[i],0,255);}
+        Text(dc,254,y0+236,180,20,L"HUD-оверлей",text,g_fontBody);Toggle(dc,455,y0+236,g_cfg.showHud);Text(dc,548,y0+236,180,20,L"Поверх окон",text,g_fontBody);Toggle(dc,782,y0+236,g_cfg.alwaysOnTop);
+        int py=474+o;FillRound(dc,228,py,642,262,16,panel);Text(dc,250,py+18,250,20,L"Процесс Minecraft",text,g_fontBody);Text(dc,478,py+18,360,20,L"Window-first • Pulse / Java / клиенты",sub,g_fontSmall);Text(dc,254,py+56,180,20,L"Автопоиск PID",text,g_fontBody);Toggle(dc,455,py+56,TRUE);Text(dc,548,py+56,190,20,L"Проверка процесса",text,g_fontBody);Toggle(dc,782,py+56,TRUE);
+        Text(dc,250,py+96,220,18,L"СТАТУС ПОДКЛЮЧЕНИЯ",sub,g_fontSmall);const wchar_t* bst=L"Minecraft не найден";if(g_bridge.state==BR_READY)bst=(g_targetHostMode==HOST_PULSE?L"Pulse подключён — PID актуален":(g_targetHostMode==HOST_JAVA?L"Java/TLauncher подключён — PID актуален":L"Другой клиент подключён — PID актуален"));else if(g_bridge.state==BR_ATTACHING)bst=L"PID найден • подключаю игровые данные…";else if(g_target.pid)bst=L"PID найден • повтор подключения к игре…";Text(dc,250,py+120,560,20,bst,g_bridge.state==BR_READY?good:sub,g_fontBody);
+        wchar_t pid[160]=L"Window PID ";wchar_t pn[24];UIntToW(g_target.pid,pn,24);WAppend(pid,pn,160);WAppend(pid,L"  •  ",160);WAppend(pid,g_target.name,160);if(g_target.pid)WAppend(pid,g_targetHostMode==HOST_PULSE?L"  •  Pulse":(g_targetHostMode==HOST_JAVA?L"  •  Java/TLauncher":L"  •  другой клиент"),160);Text(dc,250,py+148,560,18,pid,sub,g_fontSmall);wchar_t diag[150];AToW(g_bridge.status,diag,150);if(g_target.pid&&diag[0])Text(dc,250,py+174,560,18,diag,sub,g_fontSmall);
+        {DWORD hpShow=g_bridge.state==BR_READY?g_bridge.hostPid:g_diagHostPid;const wchar_t* hnShow=g_bridge.state==BR_READY?L"":g_diagHostName;wchar_t host[360]=L"";if(hpShow){WCopy(host,L"JVM PID ",360);wchar_t hn[24];UIntToW(hpShow,hn,24);WAppend(host,hn,360);if(hnShow&&hnShow[0]){WAppend(host,L" • ",360);WAppend(host,hnShow,360);}else if(g_bridge.state==BR_READY){wchar_t hpath[520];hpath[0]=0;if(GetProcessPathStrict(hpShow,hpath,520)){WAppend(host,L" • ",360);WAppend(host,BaseNamePtr(hpath),360);}}}else WCopy(host,L"JVM PID не выбран",360);WAppend(host,L" • exact jvm.dll: ",360);wchar_t ec[16];IntToW(g_diagExactJvmHosts,ec,16);WAppend(host,ec,360);Text(dc,250,py+194,560,18,host,g_bridge.state==BR_READY?good:sub,g_fontSmall);}
+        {wchar_t md[360]=L"Module scan: candidates ";wchar_t t[20];IntToW(g_diagExactCandidates,t,20);WAppend(md,t,360);WAppend(md,L" • denied ",360);IntToW(g_diagModuleDenied,t,20);WAppend(md,t,360);WAppend(md,L" • partial ",360);IntToW(g_diagModulePartial,t,20);WAppend(md,t,360);WAppend(md,L" • other ",360);IntToW(g_diagModuleOther,t,20);WAppend(md,t,360);Text(dc,250,py+216,560,18,md,(g_diagModuleDenied||g_diagModulePartial)?bad:sub,g_fontSmall);}
+        if(g_targetWindow[0]){wchar_t wt[300]=L"Окно: ";WAppend(wt,g_targetWindow,300);Text(dc,250,py+236,560,18,wt,IsMinecraftGameTitle(g_targetWindow)?good:sub,g_fontSmall);}
+    }
+    SelectClipRgn(dc,0);DeleteObject(clip);DrawScrollBar(dc);
+
+    if(g_exitConfirm){FillRound(dc,190,145,520,280,22,RGBc(12,14,18));FillRound(dc,191,146,518,278,21,RGBc(22,25,32));Text(dc,232,190,435,30,L"Вы уверены, что хотите отключить MonoClient?",text,g_fontMetric);Text(dc,232,232,435,22,L"После закрытия EXE все функции сразу остановятся.",sub,g_fontBody);Text(dc,232,262,435,20,L"Меню можно закрыть через Right Shift / Esc.",sub,g_fontSmall);FillRound(dc,232,334,204,48,13,RGBc(34,38,47));Text(dc,232,334,204,48,L"Отмена",text,g_fontBody,DT_CENTER);FillRound(dc,464,334,204,48,13,bad);Text(dc,464,334,204,48,L"Отключить",RGBc(255,248,248),g_fontBody,DT_CENTER);}
+}
+static BOOL EnsureMenuBuffer(HDC target){
+    if(g_menuDC&&g_menuBmp)return TRUE;
+    g_menuDC=CreateCompatibleDC(target);if(!g_menuDC)return FALSE;
+    g_menuBmp=CreateCompatibleBitmap(target,900,600);if(!g_menuBmp){DeleteDC(g_menuDC);g_menuDC=0;return FALSE;}
+    g_menuOld=SelectObject(g_menuDC,g_menuBmp);return TRUE;
+}
+static const COLORREF MENU_KEY=(COLORREF)0x00010001; // RGB(1,0,1), unused by the dark theme.
+static void PaintMainBuffered(HDC target){
+    RECT r;GetClientRect(g_main,&r);int w=r.right-r.left,h=r.bottom-r.top;if(w<=0||h<=0)return;
+    if(!EnsureMenuBuffer(target)){DrawMain(target);return;}
+    // During open/close animation the UI content is static. Render the 900x600 scene once
+    // and reuse it for every scale/alpha frame instead of rebuilding all GDI primitives.
+    if(g_menuAnim>=999||!g_menuCacheValid){DrawMain(g_menuDC);g_menuCacheValid=TRUE;}
+    // Keep the top-level window fixed at 900x600. Resizing a layered HWND every animation frame
+    // forces DWM to rebuild its surface and was the main source of visible flashing on some GPUs.
+    if(g_menuAnim>=999){BitBlt(target,0,0,900,600,g_menuDC,0,0,SRCCOPY);return;}
+    FillRound(target,0,0,w,h,0,MENU_KEY);
+    int scale=700+(300*g_menuAnim)/1000;int dw=900*scale/1000,dh=600*scale/1000;
+    if(dw<1)dw=1;if(dh<1)dh=1;int dx=(900-dw)/2,dy=(600-dh)/2;
+    SetStretchBltMode(target,COLORONCOLOR);StretchBlt(target,dx,dy,dw,dh,g_menuDC,0,0,900,600,SRCCOPY);
+}
