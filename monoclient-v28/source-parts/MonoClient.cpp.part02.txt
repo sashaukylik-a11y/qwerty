@@ -1,0 +1,214 @@
+static int BuildExactJvmDllHosts(DWORD windowPid,DWORD* out,int cap){
+    if(!out||cap<=0)return 0;int n=0;g_diagExactCandidates=0;
+    // Prefer the owner of the Minecraft window only if it really hosts jvm.dll.
+    if(windowPid&&windowPid!=GetCurrentProcessId()){g_diagExactCandidates++;if(ProcessHasJvmDll(windowPid))n=AddUniquePid(out,n,cap,windowPid);}
+    HANDLE ps=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);if(ps==INVALID_HANDLE_VALUE){RecordModuleEnumError(LastWinErr());return n;}
+    PROCESSENTRY32W pe;memset(&pe,0,sizeof(pe));pe.dwSize=sizeof(pe);
+    if(Process32FirstW(ps,&pe))do{
+        DWORD pid=pe.th32ProcessID;if(!pid||pid==4||pid==GetCurrentProcessId()||pid==windowPid)continue;
+        if(!IsGeminiJvmCandidateName(pe.szExeFile))continue;
+        g_diagExactCandidates++;
+        // Exact jvm.dll is the acceptance condition, exactly like the standalone detector supplied by the user.
+        if(ProcessHasJvmDll(pid))n=AddUniquePid(out,n,cap,pid);
+    }while(Process32NextW(ps,&pe));
+    else RecordModuleEnumError(LastWinErr());
+    CloseHandle(ps);return n;
+}
+static ULONGLONG GetProcCreateTimeValue(DWORD pid){HANDLE ph=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);if(!ph)return 0;FILETIME c,e,k,u;ULONGLONG v=0;if(GetProcessTimes(ph,&c,&e,&k,&u))v=FtToU64(c);CloseHandle(ph);return v;}
+// ========================= v23 window-first detector =========================
+// Fast path is window-first: enumerate top-level windows, map a Minecraft window to its PID,
+// then inspect only that PID. A full process snapshot is a rare fallback for custom-title clients.
+static const wchar_t* BaseNamePtr(const wchar_t* path){
+    if(!path)return L"";const wchar_t* b=path;for(int i=0;path[i];i++)if(path[i]==L'\\'||path[i]==L'/')b=path+i+1;return b;
+}
+static BOOL IsKnownEmbeddedClient(const wchar_t* name,const wchar_t* path){
+    const wchar_t* marks[]={L"pulse",L"lunar",L"badlion",L"feather",L"altber",L"aiaber",L"prismlauncher",L"multimc",L"modrinth",L"curseforge",L"atlauncher",L"minecraft"};
+    for(int i=0;i<(int)(sizeof(marks)/sizeof(marks[0]));i++)if(WContainsI(name,marks[i])||WContainsI(path,marks[i]))return TRUE;
+    return FALSE;
+}
+static BOOL IsDirectGameHostName(const wchar_t* name,const wchar_t* path){
+    // These are known to host the game/JVM directly. Launcher-only shells such as Prism/MultiMC
+    // are intentionally excluded from the foreground shortcut to avoid false attachment.
+    const wchar_t* marks[]={L"pulse",L"lunar",L"badlion",L"feather",L"altber",L"aiaber"};
+    for(int i=0;i<(int)(sizeof(marks)/sizeof(marks[0]));i++)if(WContainsI(name,marks[i])||WContainsI(path,marks[i]))return TRUE;
+    return FALSE;
+}
+static BOOL BuildCandidateFromPid(DWORD pid,Candidate*out,TargetHostMode*mode,BOOL requireGameWindow){
+    if(!pid||pid==GetCurrentProcessId()||!out||!mode)return FALSE;
+    wchar_t path[520];path[0]=0;if(!GetProcessPathStrict(pid,path,520))return FALSE;
+    const wchar_t* base=BaseNamePtr(path);if(!base[0]||IsExcludedName(base))return FALSE;
+    BOOL gameTitle=IsGameTitlePid(pid);if(requireGameWindow&&!gameTitle)return FALSE;
+    BOOL visible=IsVisiblePid(pid);
+    BOOL pulse=WContainsI(base,L"pulse_launcher")||WContainsI(base,L"pulse launcher")||WContainsI(path,L"pulse_launcher")||WContainsI(path,L"pulse launcher");
+    BOOL java=WEqualI(base,L"java.exe")||WEqualI(base,L"javaw.exe");
+    BOOL known=IsKnownEmbeddedClient(base,path);
+    int score=0;TargetHostMode m=HOST_NONE;
+    if(pulse){m=HOST_PULSE;score=5000;if(WEqualI(base,STRICT_TARGET_NAME))score+=700;if(WEqualI(path,STRICT_TARGET_PATH))score+=700;}
+    else if(java){m=HOST_JAVA;score=4300;if(WEqualI(base,L"javaw.exe"))score+=120;}
+    else if(known){m=HOST_GENERIC;score=3600;}
+    else if(gameTitle){m=HOST_GENERIC;score=3000;}
+    else return FALSE;
+    if(gameTitle)score+=1200;if(visible)score+=150;if(pid==g_startForegroundPid)score+=100;
+    memset(out,0,sizeof(*out));out->pid=pid;out->createTime=GetProcCreateTimeValue(pid);if(!out->createTime)return FALSE;out->visible=visible?1:0;out->score=score;WCopy(out->name,base,260);*mode=m;return TRUE;
+}
+static void AddUiCandidate(const Candidate& c){
+    if(!c.pid)return;
+    for(int i=0;i<g_candidateCount;i++)if(g_candidates[i].pid==c.pid)return;
+    int pos=g_candidateCount<MAX_UI_CANDIDATES?g_candidateCount++:MAX_UI_CANDIDATES-1;
+    if(pos<0)return;g_candidates[pos]=c;
+    while(pos>0&&g_candidates[pos].score>g_candidates[pos-1].score){Candidate t=g_candidates[pos-1];g_candidates[pos-1]=g_candidates[pos];g_candidates[pos]=t;pos--;}
+}
+static BOOL FallbackKnownProcessScan(Candidate*best,TargetHostMode*bestMode){
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);if(snap==INVALID_HANDLE_VALUE)return FALSE;
+    PROCESSENTRY32W pe;memset(&pe,0,sizeof(pe));pe.dwSize=sizeof(pe);BOOL found=FALSE;int bestScore=-1;
+    if(Process32FirstW(snap,&pe))do{
+        if(!pe.th32ProcessID||pe.th32ProcessID==4||pe.th32ProcessID==GetCurrentProcessId())continue;
+        BOOL likely=WContainsI(pe.szExeFile,L"pulse")||WEqualI(pe.szExeFile,L"java.exe")||WEqualI(pe.szExeFile,L"javaw.exe")||WContainsI(pe.szExeFile,L"lunar")||WContainsI(pe.szExeFile,L"badlion")||WContainsI(pe.szExeFile,L"feather")||WContainsI(pe.szExeFile,L"altber")||WContainsI(pe.szExeFile,L"aiaber")||WContainsI(pe.szExeFile,L"prism")||WContainsI(pe.szExeFile,L"multimc")||WContainsI(pe.szExeFile,L"modrinth")||WContainsI(pe.szExeFile,L"atlauncher");
+        if(!likely||!IsVisiblePid(pe.th32ProcessID))continue;
+        Candidate c={};TargetHostMode m=HOST_NONE;if(!BuildCandidateFromPid(pe.th32ProcessID,&c,&m,FALSE))continue;
+        // Java without a Minecraft-title is accepted only if a JVM is actually loaded.
+        // This fallback runs rarely, so module enumeration here does not become a hot path.
+        if(m==HOST_JAVA&&!ProcessHasJvmDll(c.pid))continue;
+        if(!found||c.score>bestScore){*best=c;*bestMode=m;bestScore=c.score;found=TRUE;}AddUiCandidate(c);
+    }while(Process32NextW(snap,&pe));
+    CloseHandle(snap);return found;
+}
+static void GatherCandidates(BOOL useDelta){
+    (void)useDelta;
+    g_visibleCount=0;g_gameTitleCount=0;EnumWindows(EnumVisibleProc,0);
+    g_candidateCount=0;
+    Candidate best={};TargetHostMode bestMode=HOST_NONE;int bestScore=-1;BOOL bestFromGameTitle=FALSE;
+    // Normal path: only PIDs that own an actual Minecraft window are inspected.
+    for(int i=0;i<g_gameTitleCount;i++){
+        Candidate c={};TargetHostMode m=HOST_NONE;if(!BuildCandidateFromPid(g_gameTitlePids[i],&c,&m,TRUE))continue;AddUiCandidate(c);
+        if(c.score>bestScore){best=c;bestMode=m;bestScore=c.score;bestFromGameTitle=TRUE;}
+    }
+    // Cheap custom-title shortcut: if the current foreground process is a direct game host
+    // (Pulse/Java/Lunar/etc.), accept it without waiting for the 5s full-process fallback.
+    if(!best.pid){HWND fg=GetForegroundWindow();DWORD fp=0;if(fg)GetWindowThreadProcessId(fg,&fp);if(fp&&IsVisiblePid(fp)){Candidate c={};TargetHostMode m=HOST_NONE;if(BuildCandidateFromPid(fp,&c,&m,FALSE)&&IsDirectGameHostName(c.name,L"")){best=c;bestMode=m;bestFromGameTitle=FALSE;AddUiCandidate(c);}}}
+    // Custom-title fallback: only known host names and only when window-first found nothing.
+    if(!best.pid&&useDelta){if(FallbackKnownProcessScan(&best,&bestMode))bestFromGameTitle=FALSE;}
+    if(best.pid){g_target=best;g_targetHostMode=bestMode;g_targetNeedsGameTitle=bestFromGameTitle;g_targetTitleMisses=0;}else{memset(&g_target,0,sizeof(g_target));g_targetHostMode=HOST_NONE;g_targetNeedsGameTitle=FALSE;g_targetTitleMisses=0;}
+    g_targetWindow[0]=0;g_gameWnd=0;if(g_target.pid){g_titlePid=g_target.pid;EnumWindows(EnumTargetTitle,0);}
+    g_bridgePidHint=g_target.pid;g_bridgeCreateHint=g_target.createTime;
+}
+static void InitialDetect(){ GatherCandidates(FALSE); }
+
+static void BuildCfgPath(){ DWORD n=GetModuleFileNameW(0,g_cfgPath,520); if(n==0||n>=519){WCopy(g_cfgPath,L"MonoClient.cfg",520);return;} int slash=-1; for(int i=0;g_cfgPath[i];i++)if(g_cfgPath[i]==L'\\'||g_cfgPath[i]==L'/')slash=i; if(slash>=0)g_cfgPath[slash+1]=0; else g_cfgPath[0]=0; WAppend(g_cfgPath,L"MonoClient.cfg",520); }
+static void LoadConfig(){ BuildCfgPath(); HANDLE h=CreateFileW(g_cfgPath,GENERIC_READ,FILE_SHARE_READ,0,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,0); if(h!=INVALID_HANDLE_VALUE){Config c;DWORD got=0;if(ReadFile(h,&c,sizeof(c),&got,0)&&got==sizeof(c)&&c.magic==0x4D434647&&(c.version==2||c.version==3)){g_cfg=c;if(c.version==2)g_cfg.hitMobs=1;g_cfg.version=3;g_cfg.preferVisible=!!g_cfg.preferVisible;g_cfg.showHud=!!g_cfg.showHud;g_cfg.alwaysOnTop=!!g_cfg.alwaysOnTop;g_cfg.triggerEnabled=!!g_cfg.triggerEnabled;g_cfg.criticalOnly=!!g_cfg.criticalOnly;g_cfg.hitPlayers=!!g_cfg.hitPlayers;g_cfg.hitMobs=!!g_cfg.hitMobs;g_cfg.useSword=!!g_cfg.useSword;g_cfg.useMace=!!g_cfg.useMace;g_cfg.seeInvisible=!!g_cfg.seeInvisible;g_cfg.showNames=!!g_cfg.showNames;g_cfg.swordCooldownMs=625;g_cfg.maceCooldownMs=1670;g_cfg.seeInvisible=0;g_cfg.showNames=0;if(g_cfg.invisAlpha<20||g_cfg.invisAlpha>90)g_cfg.invisAlpha=58;if(g_cfg.fov<30||g_cfg.fov>120)g_cfg.fov=70;if(g_cfg.accentR<0||g_cfg.accentR>255)g_cfg.accentR=112;if(g_cfg.accentG<0||g_cfg.accentG>255)g_cfg.accentG=126;if(g_cfg.accentB<0||g_cfg.accentB>255)g_cfg.accentB=255;if(g_cfg.scanMs<300||g_cfg.scanMs>3000)g_cfg.scanMs=1000;}CloseHandle(h);}g_cfg.autoDetect=1;g_cfg.lockTarget=1;g_cfg.seeInvisible=0;g_cfg.showNames=0;g_cfg.swordCooldownMs=625;g_cfg.maceCooldownMs=1670;}
+static void SaveConfig(){ HANDLE h=CreateFileW(g_cfgPath,GENERIC_WRITE,0,0,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,0); if(h==INVALID_HANDLE_VALUE)return; DWORD w=0;WriteFile(h,&g_cfg,sizeof(g_cfg),&w,0);CloseHandle(h); }
+
+// ========================= External HotSpot / Minecraft bridge =========================
+
+typedef unsigned long long U64;
+typedef unsigned int U32;
+typedef unsigned short U16;
+typedef unsigned char U8;
+
+static BOOL AEq(const char* a,const char* b){int i=0;for(;;i++){if(a[i]!=b[i])return FALSE;if(!a[i])return TRUE;}}
+static BOOL AEndsI(const wchar_t* s,const wchar_t* tail){int a=WLen(s),b=WLen(tail);if(b>a)return FALSE;return WEqualI(s+a-b,tail);}
+static void ACopy(char* d,const char* s,int cap){if(cap<=0)return;int i=0;for(;i<cap-1&&s&&s[i];i++)d[i]=s[i];d[i]=0;}
+
+enum BridgeState { BR_OFF=0, BR_ATTACHING=1, BR_READY=2, BR_UNSUPPORTED=3 };
+enum WeaponKind { WPN_NONE=0, WPN_SWORD=1, WPN_MACE=2 };
+enum TargetKind { TGT_NONE=0, TGT_PLAYER=1, TGT_MOB=2, TGT_OTHER=3 };
+struct TargetKindCacheEntry { U64 klass; TargetKind kind; };
+static TargetKindCacheEntry g_targetKindCache[12]={}; static int g_targetKindCacheNext=0;
+
+struct RemoteField { int offset; U16 access; char sig[96]; BOOL found; };
+struct BridgeVM {
+    HANDLE process; DWORD pid; U64 createTime; DWORD hostPid; U64 hostCreateTime; U64 jvmBase; U64 jvmSpan; BridgeState state;
+    int structsParsed; int heuristicStructs; int classesScanned; char status[128];
+    U64 cldHeadAddr; int cldNext,cldKlasses;
+    int klassName,klassNext,klassSuper,klassJavaMirror,klassLayout;
+    int oopKlass,oopCompressedKlass;
+    int ikFields,ikFieldInfoStream,ikConstants; int symLength,symBody; int cpSize;
+    U64 coopsBaseAddr,coopsShiftAddr,cklassBaseAddr,cklassShiftAddr;
+    U64 coopsBase,cklassBase; int coopsShift,cklassShift;
+    U64 mcKlass,itemsKlass,itemStackKlass,playerKlass,livingKlass,entityKlass;
+    RemoteField mcInstance,mcPlayer,mcTarget,mcScreen,mcWorld,mcGameRenderer;
+    RemoteField playerHeld,playerProfile;
+    RemoteField stackItem;
+    RemoteField swordItemFields[7],maceItemField;
+    RemoteField entOnGround,entFall,entVehicle,entWater,entEyeWater,entData,entPos;
+    RemoteField livingAttackTicker;
+    RemoteField levelPlayers;
+    RemoteField dataItems,dataItemValue,boxedByteValue;
+    RemoteField listElementData,listSize;
+    RemoteField gameProfileName,javaStringValue;
+    RemoteField rendererCamera;
+    RemoteField cameraPos,cameraYaw,cameraPitch;
+    RemoteField vecX,vecY,vecZ;
+};
+static BridgeVM g_bridge={};
+static DWORD g_diagHostPid=0; static wchar_t g_diagHostName[260]={0}; static int g_diagHostsTried=0; static int g_diagFailRank=0; static int g_diagExactJvmHosts=0;
+static BYTE g_hotspotScanBuf[262144];
+
+struct InvisibleInfo { U64 oop; double x,y,z; char name[64]; };
+struct GameSnapshot {
+    BOOL ready; U64 player,target,world; WeaponKind weapon; TargetKind targetKind;
+    BOOL onGround,touchWater,eyeWater,hasVehicle,sprinting,attackTickerKnown,criticalStateKnown; double fallDistance; int attackTicker;
+    int invisiblePlayers; char firstInvisible[64]; InvisibleInfo invis[16]; int invisCount;
+    double camX,camY,camZ; float camYaw,camPitch; BOOL cameraReady;
+};
+static GameSnapshot g_game={}; static GameSnapshot g_engineNext={};
+static ULONGLONG g_lastAttackTick=0; static int g_attackCount=0;
+static void PublishGameSnapshot(const GameSnapshot& src){memcpy(&g_game,&src,sizeof(src));}
+
+static BOOL RMem(U64 addr,void* out,SIZE_T n){ if(!g_bridge.process||!addr)return FALSE; SIZE_T got=0; return ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,out,n,&got)&&got==n; }
+static U8 R8(U64 a){U8 v=0;RMem(a,&v,1);return v;} static U16 R16(U64 a){U16 v=0;RMem(a,&v,2);return v;}
+static U32 R32(U64 a){U32 v=0;RMem(a,&v,4);return v;} static U64 R64(U64 a){U64 v=0;RMem(a,&v,8);return v;}
+static BOOL RStr(U64 a,char* out,int cap){if(!out||cap<2){return FALSE;}out[0]=0;if(!a)return FALSE;for(int i=0;i<cap-1;i++){char c=0;if(!RMem(a+i,&c,1))return FALSE;out[i]=c;if(!c)return TRUE;}out[cap-1]=0;return TRUE;}
+
+static U64 RemoteExportAt(U64 b,const char* wanted){
+    if(!b)return 0;U16 mz=R16(b);if(mz!=0x5A4D)return 0;U32 peoff=R32(b+0x3c);if(peoff<64||peoff>0x4000||R32(b+peoff)!=0x00004550)return 0;
+    U64 opt=b+peoff+24;U16 magic=R16(opt);if(magic!=0x20b&&magic!=0x10b)return 0;U32 expRva=R32(opt+(magic==0x20b?112:96));if(!expRva)return 0;U64 ed=b+expRva;
+    U32 funcs=R32(ed+28),names=R32(ed+32),ords=R32(ed+36),n=R32(ed+24);if(!funcs||!names||!ords||n==0||n>20000)return 0;
+    char nm[128];for(U32 i=0;i<n;i++){U32 nr=R32(b+names+i*4ULL);if(!nr)continue;if(!RStr(b+nr,nm,128))continue;if(AEq(nm,wanted)){U16 ord=R16(b+ords+i*2ULL);U32 fr=R32(b+funcs+ord*4ULL);return fr?b+fr:0;}}
+    return 0;
+}
+static BOOL LooksLikeHotSpotImage(U64 base){
+    if(!base)return FALSE;
+    return RemoteExportAt(base,"gHotSpotVMStructs") &&
+           RemoteExportAt(base,"gHotSpotVMStructEntryArrayStride") &&
+           RemoteExportAt(base,"gHotSpotVMTypes");
+}
+static U64 RemoteImageSize(U64 b){
+    if(!b||R16(b)!=0x5A4D)return 0;U32 peoff=R32(b+0x3c);if(peoff<64||peoff>0x4000||R32(b+peoff)!=0x00004550)return 0;
+    U64 opt=b+peoff+24;U16 magic=R16(opt);if(magic!=0x20b&&magic!=0x10b)return 0;U32 sz=R32(opt+56);if(sz<0x10000||sz>0x40000000)return 0;return (U64)sz;
+}
+static BOOL MemReadable(const MEMORY_BASIC_INFORMATION_X64& m){return m.State==MEM_COMMIT && !(m.Protect&PAGE_GUARD) && !(m.Protect&PAGE_NOACCESS);}
+static int LocalFindBytes(const BYTE* b,int n,const char* needle,int nl,int* out,int cap){
+    if(!b||!needle||nl<=0||n<nl||!out||cap<=0)return 0;int c=0;for(int i=0;i<=n-nl&&c<cap;i++){int j=0;for(;j<nl;j++)if(b[i+j]!=(BYTE)needle[j])break;if(j==nl)out[c++]=i;}return c;
+}
+static int ImageFindAscii(U64 base,U64 size,const char* needle,U64* out,int cap){
+    if(!base||!size||!needle||!out||cap<=0)return 0;int nl=0;while(needle[nl]&&nl<120)nl++;if(nl<=0)return 0;int found=0;U64 end=base+size,addr=base;MEMORY_BASIC_INFORMATION_X64 mbi;
+    while(addr<end&&found<cap){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,&mbi,sizeof(mbi));if(q!=sizeof(mbi))break;U64 rb=(U64)(ULONG_PTR)mbi.BaseAddress,re=rb+(U64)mbi.RegionSize;if(re>base&&rb<end&&MemReadable(mbi)){
+        U64 st=rb<base?base:rb,lim=re>end?end:re;for(U64 p=st;p<lim&&found<cap;){SIZE_T want=(SIZE_T)((lim-p)>sizeof(g_hotspotScanBuf)?sizeof(g_hotspotScanBuf):(lim-p));SIZE_T got=0;if(ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)p,g_hotspotScanBuf,want,&got)&&got>=(SIZE_T)nl){int offs[16];int nn=LocalFindBytes(g_hotspotScanBuf,(int)got,needle,nl,offs,16);for(int i=0;i<nn&&found<cap;i++)out[found++]=p+(U64)offs[i];}if(want<=128)break;U64 step=(U64)want-(U64)(nl>1?nl-1:0);if(!step)break;p+=step;}}
+        if(re<=addr)break;addr=re;
+    }return found;
+}
+static int ImageFindU64(U64 base,U64 size,U64 value,U64* out,int cap){
+    if(!base||!size||!value||!out||cap<=0)return 0;int found=0;U64 end=base+size,addr=base;MEMORY_BASIC_INFORMATION_X64 mbi;
+    while(addr<end&&found<cap){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)addr,&mbi,sizeof(mbi));if(q!=sizeof(mbi))break;U64 rb=(U64)(ULONG_PTR)mbi.BaseAddress,re=rb+(U64)mbi.RegionSize;if(re>base&&rb<end&&MemReadable(mbi)){
+        U64 st=rb<base?base:rb,lim=re>end?end:re;for(U64 p=st;p<lim&&found<cap;){SIZE_T want=(SIZE_T)((lim-p)>sizeof(g_hotspotScanBuf)?sizeof(g_hotspotScanBuf):(lim-p));SIZE_T got=0;if(ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)p,g_hotspotScanBuf,want,&got)&&got>=8){for(SIZE_T i=0;i+8<=got;i+=8){U64 v=0;memcpy(&v,g_hotspotScanBuf+i,8);if(v==value&&found<cap)out[found++]=p+(U64)i;}}if(want<=8)break;U64 step=(U64)want-8;if(!step)break;p+=step;}}
+        if(re<=addr)break;addr=re;
+    }return found;
+}
+static BOOL FastRemoteString(U64 a,char* out,int cap){
+    if(!a||!out||cap<2)return FALSE;out[0]=0;SIZE_T got=0;int want=cap-1;if(want>127)want=127;BYTE tmp[128];if(!ReadProcessMemory(g_bridge.process,(LPCVOID)(ULONG_PTR)a,tmp,(SIZE_T)want,&got)||got==0)return FALSE;int n=0;for(;n<(int)got&&n<cap-1;n++){char c=(char)tmp[n];out[n]=c;if(!c)return n>0;}out[n]=0;return n>0;
+}
+static BOOL PlausibleVMStructEntry(U64 e,U64 base,U64 size){
+    BYTE b[48];if(!RMem(e,b,sizeof(b)))return FALSE;U64 tp=0,fp=0;U32 st=0;memcpy(&tp,b,8);memcpy(&fp,b+8,8);memcpy(&st,b+24,4);if(!tp||!fp||st>1)return FALSE;if(tp<base||tp>=base+size||fp<base||fp>=base+size)return FALSE;char t[80],f[80];if(!FastRemoteString(tp,t,80)||!FastRemoteString(fp,f,80))return FALSE;return t[0]&&f[0];
+}
+static U64 FindVMStructAnchor(U64 base,U64 size){
+    U64 ta[8],fa[16];int tn=ImageFindAscii(base,size,"ClassLoaderDataGraph",ta,8),fn=ImageFindAscii(base,size,"_head",fa,16);if(!tn||!fn)return 0;
+    for(int ti=0;ti<tn;ti++){U64 refs[64];int rn=ImageFindU64(base,size,ta[ti],refs,64);for(int r=0;r<rn;r++){BYTE b[48];if(!RMem(refs[r],b,sizeof(b)))continue;U64 fp=0;U32 st=0;U64 addr=0;memcpy(&fp,b+8,8);memcpy(&st,b+24,4);memcpy(&addr,b+40,8);BOOL fm=FALSE;for(int fi=0;fi<fn;fi++)if(fp==fa[fi]){fm=TRUE;break;}if(fm&&st==1&&addr&&PlausibleVMStructEntry(refs[r],base,size))return refs[r];}}
+    return 0;
+}
+static BOOL HasHotSpotMarkersRange(U64 base,U64 size){if(!base||size<0x10000||size>0x40000000)return FALSE;U64 a[2],b[2],c[2];return ImageFindAscii(base,size,"ClassLoaderDataGraph",a,2)>0&&ImageFindAscii(base,size,"_fieldinfo_stream",b,2)>0&&ImageFindAscii(base,size,"CompressedOops",c,2)>0;}
+static BOOL HasHotSpotMarkers(U64 base){U64 size=RemoteImageSize(base);return size?HasHotSpotMarkersRange(base,size):FALSE;}
+static U64 AllocationSpan(U64 base,BOOL*hasExec){
+    if(hasExec)*hasExec=FALSE;if(!base)return 0;U64 p=base,end=base;MEMORY_BASIC_INFORMATION_X64 m;for(int g=0;g<8192;g++){SIZE_T q=VirtualQueryEx(g_bridge.process,(LPCVOID)(ULONG_PTR)p,&m,sizeof(m));if(q!=sizeof(m)||(U64)(ULONG_PTR)m.AllocationBase!=base)break;U64 re=(U64)(ULONG_PTR)m.BaseAddress+(U64)m.RegionSize;if(MemReadable(m)&&(m.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))&&hasExec)*hasExec=TRUE;if(re>end)end=re;if(re<=p)break;p=re;}return end>base?end-base:0;
+}
+static int HeuristicConstantPoolSize(U64 base,U64 size){
