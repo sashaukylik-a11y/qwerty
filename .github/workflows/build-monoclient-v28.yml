@@ -22,17 +22,49 @@ jobs:
         shell: cmd
         run: reconstruct-source.cmd
 
+      - name: Verify reconstructed source hash
+        shell: powershell
+        run: |
+          $expected = (Get-Content .\SOURCE_SHA256-v28.txt).Split()[0].ToLowerInvariant()
+          $actual = (Get-FileHash .\MonoClient.cpp -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Source SHA mismatch: $actual != $expected" }
+
       - name: Build x64 EXE
         shell: cmd
         run: build.cmd
 
-      - name: Show SHA-256
+      - name: Audit embedded manifest and PE
         shell: powershell
-        run: Get-FileHash .\MonoClient-Full-v28.exe -Algorithm SHA256
+        run: |
+          $bytes = [IO.File]::ReadAllBytes(".\MonoClient-Full-v28.exe")
+          if ($bytes.Length -lt 4096) { throw "EXE unexpectedly small" }
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Missing MZ header" }
+          $ascii = [Text.Encoding]::UTF8.GetString($bytes)
+          if (-not $ascii.Contains("requireAdministrator")) { throw "UAC manifest was not embedded" }
+          if (-not $ascii.Contains("MonoClient.v28")) { throw "Manifest identity missing" }
 
-      - name: Upload fixed EXE
+      - name: Smoke launch
+        shell: powershell
+        run: |
+          $p = Start-Process -FilePath ".\MonoClient-Full-v28.exe" -PassThru
+          Start-Sleep -Seconds 4
+          if ($p.HasExited) { throw "MonoClient exited during startup. ExitCode=$($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+
+      - name: Reproducibility check
+        shell: powershell
+        run: |
+          Copy-Item .\MonoClient-Full-v28.exe .\build-first.exe
+          cmd /c build.cmd
+          $h1 = (Get-FileHash .\build-first.exe -Algorithm SHA256).Hash
+          $h2 = (Get-FileHash .\MonoClient-Full-v28.exe -Algorithm SHA256).Hash
+          if ($h1 -ne $h2) { throw "Non-reproducible build: $h1 != $h2" }
+          Write-Host "SHA256 $h2"
+
+      - name: Upload audited EXE
         uses: actions/upload-artifact@v4
         with:
-          name: MonoClient-Full-v28-RSHIFT-FIX
+          name: MonoClient-Full-v28-AUDITED
           path: monoclient-v28/MonoClient-Full-v28.exe
           if-no-files-found: error
