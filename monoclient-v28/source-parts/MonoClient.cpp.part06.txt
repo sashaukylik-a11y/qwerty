@@ -102,7 +102,14 @@ static DWORD WINAPI EngineWorker(LPVOID){
         }
 
         BOOL active=(g_target.pid&&GameForeground());
-        if(!g_cfg.triggerEnabled){Sleep(180);continue;}
+
+        // Connection state must not depend on the combat toggle. Previously this early-off path
+        // skipped BridgeEnsure(), so the UI could find the Minecraft window but remain forever at
+        // "JVM PID not selected / candidates 0" until TriggerBot itself was enabled.
+        if(!g_cfg.triggerEnabled){
+            if(g_target.pid&&now-lastIdleAttach>=1000){lastIdleAttach=now;BridgeEnsure();}
+            Sleep(180);continue;
+        }
 
         if(!active){
             // Keep attach asynchronous, but never poll Minecraft state while the game is not foreground.
