@@ -51,6 +51,56 @@ jobs:
           Stop-Process -Id $p.Id -Force
           Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
 
+      - name: Right Shift regression test
+        shell: powershell
+        run: |
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win32 {
+            [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+            [DllImport("user32.dll")]
+            public static extern bool IsWindowVisible(IntPtr hWnd);
+            [DllImport("user32.dll")]
+            public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+            [DllImport("user32.dll", SetLastError=true)]
+            public static extern bool GetLayeredWindowAttributes(IntPtr hwnd, out uint crKey, out byte bAlpha, out uint dwFlags);
+          }
+"@
+          function Press-RShift {
+            [Win32]::keybd_event(0xA1, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 70
+            [Win32]::keybd_event(0xA1, 0, 2, [UIntPtr]::Zero)
+          }
+          $p = Start-Process -FilePath ".\MonoClient-Full-v28.exe" -PassThru
+          try {
+            Start-Sleep -Seconds 2
+            if ($p.HasExited) { throw "MonoClient exited before hotkey test. ExitCode=$($p.ExitCode)" }
+            $h = [Win32]::FindWindow("MonoClient.Main", $null)
+            if ($h -eq [IntPtr]::Zero) { throw "MonoClient.Main window was not created" }
+            if ([Win32]::IsWindowVisible($h)) { throw "Menu should start hidden" }
+
+            Press-RShift
+            Start-Sleep -Milliseconds 700
+            if (-not [Win32]::IsWindowVisible($h)) { throw "FIRST Right Shift did not open menu" }
+            $key=[uint32]0; $alpha=[byte]0; $flags=[uint32]0
+            [void][Win32]::GetLayeredWindowAttributes($h, [ref]$key, [ref]$alpha, [ref]$flags)
+            if ($alpha -lt 200) { throw "Menu opened with unexpectedly low alpha: $alpha" }
+
+            Press-RShift
+            Start-Sleep -Milliseconds 700
+            if ([Win32]::IsWindowVisible($h)) { throw "Second Right Shift did not close menu" }
+
+            Press-RShift
+            Start-Sleep -Milliseconds 700
+            if (-not [Win32]::IsWindowVisible($h)) { throw "Third Right Shift did not reopen menu" }
+          }
+          finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            Wait-Process -Id $p.Id -ErrorAction SilentlyContinue
+          }
+
       - name: Reproducibility check
         shell: powershell
         run: |
