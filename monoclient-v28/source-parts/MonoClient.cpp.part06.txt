@@ -123,6 +123,12 @@ static DWORD WINAPI EngineWorker(LPVOID){
     return 0;
 }
 static LRESULT CALLBACK HudProc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_ERASEBKGND)return 1;if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintHudBuffered(dc,ps.rcPaint);EndPaint(h,&ps);return 0;}return DefWindowProcW(h,m,w,l);}
+static BOOL ReadRightShiftDown(){
+    if(GetAsyncKeyState(VK_RSHIFT)&0x8000)return TRUE;
+    // Fallback for launchers/remote-input layers that expose only generic VK_SHIFT.
+    // Exclude an actual left-shift press so LSHIFT never becomes the menu hotkey.
+    return ((GetAsyncKeyState(VK_SHIFT)&0x8000)!=0)&&((GetAsyncKeyState(VK_LSHIFT)&0x8000)==0);
+}
 static void HandleRShiftState(BOOL down){
     if(down&&!g_rshiftDown)ToggleMenuReliable();
     g_rshiftDown=down;
@@ -150,7 +156,7 @@ static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
  if(m==WM_TIMER){
     // One authoritative 16 ms RSHIFT edge detector. The hidden window still receives WM_TIMER,
     // so short taps cannot fall into a 100 ms polling gap and there is no worker/timer race.
-    HandleRShiftState((GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE);
+    HandleRShiftState(ReadRightShiftDown());
     TickMenuAnimation();
     static ULONGLONG lastMenuStatus=0,lastHud=0,lastGeom=0;ULONGLONG now=GetTickCount64();
     BOOL animating=(g_menuAnim!=g_menuAnimTarget);
@@ -216,7 +222,7 @@ extern "C" void WINAPI wWinMainCRTStartup(){
     if(!g_main)ExitProcess(2);SetLayeredWindowAttributes(g_main,MENU_KEY,0,LWA_ALPHA|LWA_COLORKEY);
     g_hud=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,L"MonoClient.Hud",L"MonoClient HUD",WS_POPUP,24,24,380,110,0,0,inst,0);
     RECT r;GetClientRect(g_main,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(g_main,rg,TRUE);g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);
-    g_rshiftDown=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
+    g_rshiftDown=ReadRightShiftDown();
     UpdateTopmost();UpdateHudState();
 #ifdef MONO_CI_RSHIFT_TEST
     DWORD selfTid=0;HANDLE selfThread=CreateThread(0,0,RShiftSelfTestWorker,0,0,&selfTid);if(!selfThread)ExitProcess(100);CloseHandle(selfThread);
