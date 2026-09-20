@@ -1,0 +1,38 @@
+name: Build MonoClient v28 hotfix
+
+on:
+  push:
+    branches:
+      - fix/v28-rshift-menu
+    paths:
+      - "monoclient-v28/**"
+      - ".github/workflows/build-monoclient-v28.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: monoclient-v28
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct source
+        shell: cmd
+        run: reconstruct-source.cmd
+
+      - name: Build x64 EXE
+        shell: cmd
+        run: build.cmd
+
+      - name: Show SHA-256
+        shell: powershell
+        run: Get-FileHash .\MonoClient-Full-v28.exe -Algorithm SHA256
+
+      - name: Upload fixed EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonoClient-Full-v28-RSHIFT-FIX
+          path: monoclient-v28/MonoClient-Full-v28.exe
+          if-no-files-found: error
