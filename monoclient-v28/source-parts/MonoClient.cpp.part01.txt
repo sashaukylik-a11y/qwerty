@@ -123,7 +123,7 @@ static HWND g_gameWnd=0;
 // Strict Pulse launcher target requested by the operator.
 // Minecraft 1.21.11 is hosted directly inside this EXE; there is no java.exe.
 static const wchar_t* STRICT_TARGET_NAME = L"pulse_launcher (2).exe";
-static const wchar_t* STRICT_TARGET_PATH = L"C:\Users\U10\Downloads\pulse_launcher (2).exe";
+static const wchar_t* STRICT_TARGET_PATH = L"C:\\Users\\U10\\Downloads\\pulse_launcher (2).exe";
 static const wchar_t* STRICT_TARGET_TITLE = L"Minecraft";
 enum TargetHostMode { HOST_NONE=0, HOST_PULSE=1, HOST_JAVA=2, HOST_GENERIC=3 };
 static TargetHostMode g_targetHostMode=HOST_NONE;
@@ -182,7 +182,7 @@ static ULONGLONG FindExactJvmDllToolhelp(DWORD pid,ULONGLONG* spanOut){
     if(s==INVALID_HANDLE_VALUE){RecordModuleEnumError(LastWinErr());return 0;}
     MODULEENTRY32W me;memset(&me,0,sizeof(me));me.dwSize=sizeof(me);ULONGLONG base=0,span=0;
     if(Module32FirstW(s,&me)){do{
-        if(WEqualI(me.szModule,L"jvm.dll")||AEndsI(me.szExePath,L"\jvm.dll")){base=(ULONGLONG)(ULONG_PTR)me.modBaseAddr;span=(ULONGLONG)me.modBaseSize;break;}
+        if(WEqualI(me.szModule,L"jvm.dll")||AEndsI(me.szExePath,L"\\jvm.dll")){base=(ULONGLONG)(ULONG_PTR)me.modBaseAddr;span=(ULONGLONG)me.modBaseSize;break;}
     }while(Module32NextW(s,&me));}
     else RecordModuleEnumError(LastWinErr());
     CloseHandle(s);if(spanOut)*spanOut=span;return base;
