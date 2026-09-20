@@ -17,6 +17,8 @@
 #define WM_NCLBUTTONDOWN 0x00A1
 #define WM_SIZE 0x0005
 #define HTCAPTION 2
+#define VK_SHIFT 0x10
+#define VK_LSHIFT 0xA0
 #define VK_RSHIFT 0xA1
 #define VK_ESCAPE 0x1B
 #define VK_LBUTTON 0x01
