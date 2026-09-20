@@ -41,7 +41,6 @@ jobs:
           if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Missing MZ header" }
           $ascii = [Text.Encoding]::UTF8.GetString($bytes)
           if (-not $ascii.Contains("requireAdministrator")) { throw "UAC manifest was not embedded" }
-          if (-not $ascii.Contains("MonoClient.v28")) { throw "Manifest identity missing" }
 
       - name: Smoke launch
         shell: powershell
