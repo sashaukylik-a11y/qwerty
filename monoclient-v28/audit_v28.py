@@ -7,6 +7,44 @@ build=(root/'build.cmd').read_text(encoding='utf-8',errors='ignore')
 workflow=(root.parent/'.github'/'workflows'/'build-monoclient-v28.yml').read_text(encoding='utf-8',errors='ignore')
 checks=[]
 def ck(group,name,cond): checks.append((group,name,bool(cond)))
+
+def pe_import_dlls(data: bytes):
+    def u16(o): return int.from_bytes(data[o:o+2],'little')
+    def u32(o): return int.from_bytes(data[o:o+4],'little')
+    if len(data)<0x100 or data[:2]!=b'MZ': return set()
+    peoff=u32(0x3c)
+    if peoff+24>=len(data) or data[peoff:peoff+4]!=b'PE\0\0': return set()
+    nsec=u16(peoff+6); optsz=u16(peoff+20); opt=peoff+24
+    if u16(opt)!=0x20b: return set()
+    dd=opt+112
+    imp_rva=u32(dd+8); imp_size=u32(dd+12)
+    if not imp_rva or not imp_size: return set()
+    sh=opt+optsz
+    sections=[]
+    for i in range(nsec):
+        o=sh+i*40
+        if o+40>len(data): break
+        vsize=u32(o+8); va=u32(o+12); rawsz=u32(o+16); raw=u32(o+20)
+        sections.append((va,max(vsize,rawsz),raw))
+    def rva_off(rva):
+        for va,span,raw in sections:
+            if va<=rva<va+span:
+                return raw+(rva-va)
+        return None
+    off=rva_off(imp_rva)
+    if off is None: return set()
+    out=set()
+    for _ in range(256):
+        if off+20>len(data): break
+        desc=data[off:off+20]
+        if desc==b'\0'*20: break
+        name_rva=u32(off+12); no=rva_off(name_rva)
+        if no is not None and no<len(data):
+            end=data.find(b'\0',no,min(len(data),no+260))
+            if end!=-1:
+                out.add(data[no:end].decode('ascii','ignore').lower())
+        off+=20
+    return out
 def section(a,b):
     i=src.index(a); j=src.index(b,i+len(a)); return src[i:j]
 
@@ -84,9 +122,9 @@ ck(6,'active loop 16ms','Sleep(16)' in eng)
 ck(6,'See Invisible disabled','g_cfg.seeInvisible=0' in src and 'WorldToScreen' not in src)
 
 # 7 import/safety shape
-ascii_dlls={m.group(1).decode('ascii','ignore').lower() for m in re.finditer(rb'([A-Za-z0-9._-]+\\.dll)',exe,re.I)}
+import_dlls=pe_import_dlls(exe)
 allowed={'kernel32.dll','user32.dll','gdi32.dll'}
-ck(7,'only kernel/user/gdi static imports',bool(ascii_dlls) and ascii_dlls<=allowed and {'kernel32.dll','user32.dll','gdi32.dll'}<=ascii_dlls)
+ck(7,'only kernel/user/gdi static imports',import_dlls==allowed)
 for good in ['ReadProcessMemory','SendInput','CreateToolhelp32Snapshot','Module32FirstW','Module32NextW']:
     ck(7,f'import {good}',good.encode('ascii') in exe)
 for bad in ['WriteProcessMemory','VirtualAllocEx','CreateRemoteThread','SetWindowsHookExW','SetWindowsHookExA']:
