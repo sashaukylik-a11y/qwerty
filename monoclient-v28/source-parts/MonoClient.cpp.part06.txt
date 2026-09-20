@@ -33,18 +33,24 @@ static void UpdateTopmost(){
 }
 static void OpenMenuReliable(){
     if(!g_main)return;
-    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<140)return;g_lastMenuToggleTick=now;
+    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<50)return;g_lastMenuToggleTick=now;
     ReleaseCapture();g_dragSlider=0;g_exitConfirm=FALSE;g_menuVisible=TRUE;
+    // Make the first key press visible immediately instead of waiting for the hidden 100 ms timer.
+    if(g_menuAnim<=0){g_menuAnim=60;ApplyMenuAnimation();}
+    StartMenuAnimation(1000);g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);
     SetWindowPos(g_main,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
-    ShowWindow(g_main,SW_SHOW);SetForegroundWindow(g_main);
-    StartMenuAnimation(1000);InvalidateRect(g_main,0,FALSE);
+    ShowWindow(g_main,SW_SHOW);UpdateWindow(g_main);SetForegroundWindow(g_main);
+    InvalidateRect(g_main,0,FALSE);
 }
 static void CloseMenuReliable(){
     if(!g_main)return;
-    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<140)return;g_lastMenuToggleTick=now;
+    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<50)return;g_lastMenuToggleTick=now;
     ReleaseCapture();g_dragSlider=0;g_exitConfirm=FALSE;StartMenuAnimation(0);
+    g_uiTimerMs=16;SetTimer(g_main,1,g_uiTimerMs,0);
 }
-static void ToggleMenuReliable(){if(g_menuAnimTarget>0||g_menuVisible)CloseMenuReliable();else OpenMenuReliable();}
+// Animation target is the authoritative state. While fading out g_menuVisible stays TRUE
+// until the final frame, so checking it here used to consume the first reopen press.
+static void ToggleMenuReliable(){if(g_menuAnimTarget>0)CloseMenuReliable();else OpenMenuReliable();}
 static void UpdateHudState(){if(!g_hud)return;g_lastHudAlpha=-1;UpdateOverlayGeometry();if(g_hudShown)InvalidateRect(g_hud,0,FALSE);}
 static void SetCustomSlider(int id,int x,int left,int w,int minv,int maxv){if(x<left)x=left;if(x>left+w)x=left+w;int v=minv+(x-left)*(maxv-minv)/w;if(id==14)g_cfg.accentR=v;else if(id==15)g_cfg.accentG=v;else if(id==16)g_cfg.accentB=v;InvalidateRect(g_main,0,FALSE);RequestStatusRedraw();}
 static BOOL EnsureHudBuffer(HDC target,int w,int h){
@@ -112,7 +118,8 @@ static DWORD WINAPI EngineWorker(LPVOID){
 static LRESULT CALLBACK HudProc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_ERASEBKGND)return 1;if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintHudBuffered(dc,ps.rcPaint);EndPaint(h,&ps);return 0;}return DefWindowProcW(h,m,w,l);}
 static DWORD WINAPI MenuHotkeyWorker(LPVOID){
     SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
-    BOOL down=FALSE;
+    // Do not treat a key already held while the client starts as a new press.
+    BOOL down=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
     while(!g_hotkeyStop){
         BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
         if(kd&&!down&&g_main)SendMessageW(g_main,WM_MONO_TOGGLE,0,0);
@@ -124,11 +131,14 @@ static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
  if(m==WM_ERASEBKGND)return 1;
  if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintMainBuffered(dc);EndPaint(h,&ps);return 0;}
  if(m==WM_TIMER){
-    // UI-timer polling is a backup for the dedicated global RSHIFT worker.
-    // ToggleMenuReliable debounces both paths so one press cannot toggle twice.
-    BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
-    if(kd&&!g_rshiftDown)ToggleMenuReliable();
-    g_rshiftDown=kd;TickMenuAnimation();
+    // Poll RSHIFT only if the dedicated worker could not be created.
+    // Running both detectors at once creates two independent edge states for one physical key.
+    if(!g_hotkeyThread){
+        BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
+        if(kd&&!g_rshiftDown)ToggleMenuReliable();
+        g_rshiftDown=kd;
+    }
+    TickMenuAnimation();
     static ULONGLONG lastMenuStatus=0,lastHud=0,lastGeom=0;ULONGLONG now=GetTickCount64();
     BOOL animating=(g_menuAnim!=g_menuAnimTarget);
     UINT wantTimer=animating?16:100;if(wantTimer!=g_uiTimerMs){g_uiTimerMs=wantTimer;SetTimer(h,1,g_uiTimerMs,0);}
