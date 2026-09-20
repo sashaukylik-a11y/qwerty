@@ -124,7 +124,7 @@ static int BuildGlobalJvmModuleHosts(DWORD root,DWORD* out,int cap){
     if(Process32FirstW(ps,&pe))do{DWORD pid=pe.th32ProcessID;if(!pid||pid==4||pid==GetCurrentProcessId()||pid==root||BridgeHostNameBad(pid))continue;HANDLE ms=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid);if(ms==INVALID_HANDLE_VALUE)continue;MODULEENTRY32W me;memset(&me,0,sizeof(me));me.dwSize=sizeof(me);BOOL hit=FALSE;if(Module32FirstW(ms,&me))do{if(IsJvmNamedModule(me.szModule,me.szExePath)){hit=TRUE;break;}}while(Module32NextW(ms,&me));CloseHandle(ms);if(hit)AddRankedHost(ranked,&rn,64,pid,rc,1800);}while(Process32NextW(ps,&pe));CloseHandle(ps);SortHosts(ranked,rn);int n=0;for(int i=0;i<rn&&n<cap;i++)n=AddUniquePid(out,n,cap,ranked[i].pid);return n;
 }
 
-static ULONGLONG g_bridgeRetryAt=0; static volatile LONG g_bridgeAttachBusy=0; static DWORD g_attachPid=0; static ULONGLONG g_attachCreate=0;
+static ULONGLONG g_bridgeRetryAt=0; static volatile LONG g_bridgeAttachBusy=0; static HANDLE g_bridgeAttachThread=0; static DWORD g_attachPid=0; static ULONGLONG g_attachCreate=0;
 static DWORD g_bridgeAttemptPid=0; static ULONGLONG g_bridgeAttemptCreate=0; static int g_bridgeAttemptCount=0;
 static void ResetBridgeAttempts(){g_bridgeRetryAt=0;g_bridgeAttemptPid=g_bridgePidHint;g_bridgeAttemptCreate=g_bridgeCreateHint;g_bridgeAttemptCount=0;}
 static void BridgeClose(){if(g_bridge.process)CloseHandle(g_bridge.process);memset(&g_bridge,0,sizeof(g_bridge));GameSnapshot z={};PublishGameSnapshot(z);memset(g_targetKindCache,0,sizeof(g_targetKindCache));g_targetKindCacheNext=0;}
@@ -183,8 +183,11 @@ static BOOL BridgeEnsure(){
     if(!g_bridgePidHint)return FALSE;
     if(g_bridgeAttemptPid!=g_bridgePidHint||g_bridgeAttemptCreate!=g_bridgeCreateHint)ResetBridgeAttempts();
     if(g_bridgeAttachBusy)return FALSE;
+    // A completed attach worker used to be detached immediately, so shutdown could race it.
+    // Reap the previous handle before starting the next attempt and keep the active one joinable.
+    if(g_bridgeAttachThread){CloseHandle(g_bridgeAttachThread);g_bridgeAttachThread=0;}
     ULONGLONG now=GetTickCount64();if(now<g_bridgeRetryAt)return FALSE;
     g_attachPid=g_bridgePidHint;g_attachCreate=g_bridgeCreateHint;g_bridgeAttachBusy=1;g_bridgeAttemptCount++;
-    DWORD tid=0;HANDLE th=CreateThread(0,0,BridgeAttachWorker,0,0,&tid);if(!th){g_bridgeAttachBusy=0;g_bridgeRetryAt=now+30000;ACopy(g_bridge.status,"attach worker create failed",128);return FALSE;}CloseHandle(th);return FALSE;
+    DWORD tid=0;g_bridgeAttachThread=CreateThread(0,0,BridgeAttachWorker,0,0,&tid);if(!g_bridgeAttachThread){g_bridgeAttachBusy=0;g_bridgeRetryAt=now+30000;ACopy(g_bridge.status,"attach worker create failed",128);return FALSE;}return FALSE;
 }
 static WeaponKind CurrentWeapon(U64 player){
