@@ -102,7 +102,6 @@ static DWORD g_startForegroundPid=0;
 static HWND g_main=0, g_hud=0;
 static BOOL g_menuVisible=FALSE, g_rshiftDown=FALSE;
 static ULONGLONG g_lastMenuToggleTick=0;
-static volatile LONG g_hotkeyStop=0; static HANDLE g_hotkeyThread=0;
 static int g_menuAnim=0, g_menuAnimTarget=0;
 static int g_menuCenterX=0, g_menuCenterY=0;
 static HDC g_menuDC=0; static HBITMAP g_menuBmp=0; static HGDIOBJ g_menuOld=0; static BOOL g_menuCacheValid=FALSE;
