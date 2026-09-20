@@ -1,0 +1,198 @@
+static void MapMouseToDesign(HWND h,LPARAM l,int*x,int*y){RECT r;GetClientRect(h,&r);int w=r.right-r.left,hh=r.bottom-r.top;if(w<1)w=1;if(hh<1)hh=1;*x=LoWord(l)*900/w;*y=HiWord(l)*600/hh;}
+static void RememberMenuCenter(){if(!g_main)return;RECT r;if(GetWindowRect(g_main,&r)){g_menuCenterX=(r.left+r.right)/2;g_menuCenterY=(r.top+r.bottom)/2;}}
+static int SmoothStep1000(int p){if(p<0)p=0;if(p>1000)p=1000;LONGLONG x=p;return (int)((x*x*(3000-2*x))/1000000LL);}
+static void StartMenuAnimation(int target){
+    if(!g_main)return;
+    // Never leave Win32 mouse capture owned by a window that is fading out. This fixes the
+    // disappearing/stuck cursor after Esc while a slider was being dragged.
+    if(target==0){g_dragSlider=0;ReleaseCapture();}
+    if(target>0)g_menuCacheValid=FALSE;g_menuAnimStartTick=GetTickCount64();g_menuAnimStartValue=g_menuAnim;g_menuAnimTarget=target;
+}
+static void ApplyMenuAnimation(){
+    if(!g_main)return;BYTE a=(BYTE)((255*g_menuAnim)/1000);
+    // Alpha + color-key animation inside a fixed window avoids DWM resize churn/flicker.
+    SetLayeredWindowAttributes(g_main,MENU_KEY,a,LWA_ALPHA|LWA_COLORKEY);
+}
+static void RestoreGameFocus(){
+    ReleaseCapture();g_dragSlider=0;
+    if(g_target.pid){g_targetWindow[0]=0;g_gameWnd=0;g_titlePid=g_target.pid;EnumWindows(EnumTargetTitle,0);}
+    if(g_gameWnd){DWORD p=0;GetWindowThreadProcessId(g_gameWnd,&p);if(p==g_target.pid)SetForegroundWindow(g_gameWnd);}
+}
+static void UpdateTopmost();
+static void TickMenuAnimation(){
+    if(g_menuAnim==g_menuAnimTarget)return;
+    ULONGLONG elapsed=GetTickCount64()-g_menuAnimStartTick;int p=(int)(elapsed*1000ULL/180ULL);if(p>1000)p=1000;int e=SmoothStep1000(p);
+    g_menuAnim=g_menuAnimStartValue+(g_menuAnimTarget-g_menuAnimStartValue)*e/1000;
+    if(p>=1000)g_menuAnim=g_menuAnimTarget;ApplyMenuAnimation();
+    if(g_menuAnim==0&&g_menuAnimTarget==0){g_menuVisible=FALSE;ShowWindow(g_main,SW_HIDE);UpdateTopmost();RestoreGameFocus();}
+}
+static void DrawHud(HDC dc){FillRoundBrush(dc,0,0,g_overlayW,g_overlayH,0,(HBRUSH)GetStockObject(BLACK_BRUSH));if(!g_cfg.showHud)return;COLORREF text=RGBc(234,237,244),sub=RGBc(138,145,159),good=RGBc(92,215,151);FillRound(dc,18,18,340,90,17,RGBc(16,19,24));FillRound(dc,31,32,5,60,5,Accent());Text(dc,49,28,180,22,L"MonoClient",text,g_fontBody);const wchar_t* hs=0;if(g_bridge.state==BR_READY)hs=(g_targetHostMode==HOST_PULSE?L"Minecraft подключён • Pulse":(g_targetHostMode==HOST_JAVA?L"Minecraft подключён • Java":L"Minecraft подключён • клиент"));else if(!g_target.pid)hs=L"Minecraft не найден";else if(!g_cfg.triggerEnabled)hs=L"PID найден • триггер выключен";else if(g_bridgeAttachBusy)hs=L"PID найден • подключение в фоне…";else if(g_bridge.state==BR_UNSUPPORTED)hs=L"PID найден • повтор подключения позже";else hs=L"PID найден • подключаю игровые данные…";Text(dc,49,50,285,18,hs,g_bridge.state==BR_READY?good:sub,g_fontSmall);wchar_t line[160]=L"Триггер ";WAppend(line,g_cfg.triggerEnabled?L"ВКЛ":L"ВЫКЛ",160);WAppend(line,L"  •  Low CPU",160);Text(dc,49,72,270,18,line,sub,g_fontSmall);}
+static void UpdateTopmost(){
+    // A visible menu must stay reachable even when the persistent "Поверх окон" option is off.
+    if(g_main)SetWindowPos(g_main,(g_menuVisible||g_cfg.alwaysOnTop)?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+}
+static void OpenMenuReliable(){
+    if(!g_main)return;
+    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<140)return;g_lastMenuToggleTick=now;
+    ReleaseCapture();g_dragSlider=0;g_exitConfirm=FALSE;g_menuVisible=TRUE;
+    SetWindowPos(g_main,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
+    ShowWindow(g_main,SW_SHOW);SetForegroundWindow(g_main);
+    StartMenuAnimation(1000);InvalidateRect(g_main,0,FALSE);
+}
+static void CloseMenuReliable(){
+    if(!g_main)return;
+    ULONGLONG now=GetTickCount64();if(now-g_lastMenuToggleTick<140)return;g_lastMenuToggleTick=now;
+    ReleaseCapture();g_dragSlider=0;g_exitConfirm=FALSE;StartMenuAnimation(0);
+}
+static void ToggleMenuReliable(){if(g_menuAnimTarget>0||g_menuVisible)CloseMenuReliable();else OpenMenuReliable();}
+static void UpdateHudState(){if(!g_hud)return;g_lastHudAlpha=-1;UpdateOverlayGeometry();if(g_hudShown)InvalidateRect(g_hud,0,FALSE);}
+static void SetCustomSlider(int id,int x,int left,int w,int minv,int maxv){if(x<left)x=left;if(x>left+w)x=left+w;int v=minv+(x-left)*(maxv-minv)/w;if(id==14)g_cfg.accentR=v;else if(id==15)g_cfg.accentG=v;else if(id==16)g_cfg.accentB=v;InvalidateRect(g_main,0,FALSE);RequestStatusRedraw();}
+static BOOL EnsureHudBuffer(HDC target,int w,int h){
+    if(w<1||h<1)return FALSE;
+    if(g_hudDC&&g_hudBmp&&g_hudBufW==w&&g_hudBufH==h)return TRUE;
+    if(g_hudDC){SelectObject(g_hudDC,g_hudOld);DeleteObject(g_hudBmp);DeleteDC(g_hudDC);g_hudDC=0;g_hudBmp=0;g_hudOld=0;}
+    g_hudDC=CreateCompatibleDC(target);if(!g_hudDC)return FALSE;
+    g_hudBmp=CreateCompatibleBitmap(target,w,h);if(!g_hudBmp){DeleteDC(g_hudDC);g_hudDC=0;return FALSE;}
+    g_hudOld=SelectObject(g_hudDC,g_hudBmp);g_hudBufW=w;g_hudBufH=h;return TRUE;
+}
+static void PaintHudBuffered(HDC target,const RECT& paint){
+    RECT r;GetClientRect(g_hud,&r);int w=r.right-r.left,h=r.bottom-r.top;if(w<=0||h<=0)return;
+    if(!EnsureHudBuffer(target,w,h)){DrawHud(target);return;}
+    RECT p=paint;if(p.left<0)p.left=0;if(p.top<0)p.top=0;if(p.right>w)p.right=w;if(p.bottom>h)p.bottom=h;if(!RectGood(p)){p.left=0;p.top=0;p.right=w;p.bottom=h;}
+    HRGN clip=CreateRectRgn(p.left,p.top,p.right,p.bottom);SelectClipRgn(g_hudDC,clip);DrawHud(g_hudDC);SelectClipRgn(g_hudDC,0);DeleteObject(clip);
+    BitBlt(target,p.left,p.top,p.right-p.left,p.bottom-p.top,g_hudDC,p.left,p.top,SRCCOPY);
+}
+static volatile LONG g_engineStop=0; static HANDLE g_engineThread=0;
+static BOOL FastTargetAlive(){
+    if(!g_target.pid||!g_target.createTime)return FALSE;
+    ULONGLONG ct=GetProcCreateTimeValue(g_target.pid);if(!ct||ct!=g_target.createTime)return FALSE;
+    if(g_bridgePidHint&&g_bridgePidHint!=g_target.pid){ULONGLONG bt=GetProcCreateTimeValue(g_bridgePidHint);if(!bt||bt!=g_bridgeCreateHint)return FALSE;}
+    // Keep the already proven game HWND when possible. This avoids a full EnumWindows pass
+    // every health check and survives title changes/blank titles during Alt+Enter fullscreen.
+    if(g_gameWnd&&IsWindowVisible(g_gameWnd)){DWORD wp=0;GetWindowThreadProcessId(g_gameWnd,&wp);if(wp==g_target.pid){int n=GetWindowTextLengthW(g_gameWnd);if(n>0)GetWindowTextW(g_gameWnd,g_targetWindow,260);else g_targetWindow[0]=0;g_targetTitleMisses=0;return TRUE;}}
+    g_targetWindow[0]=0;g_gameWnd=0;g_titlePid=g_target.pid;EnumWindows(EnumTargetTitle,0);
+    if(!g_gameWnd){if(++g_targetTitleMisses<2)return TRUE;return FALSE;}
+    // If this PID was initially proven by a Minecraft-titled game window, do not let a
+    // different launcher/settings HWND keep a stale target alive after the game closes.
+    if(g_targetNeedsGameTitle&&!IsMinecraftGameTitle(g_targetWindow)){if(++g_targetTitleMisses<2)return TRUE;return FALSE;}
+    g_targetTitleMisses=0;return TRUE;
+}
+static DWORD WINAPI EngineWorker(LPVOID){
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+    ULONGLONG lastFastSearch=0,lastDeepSearch=0,lastIdentity=0,lastIdleAttach=0;
+    while(!g_engineStop){
+        ULONGLONG now=GetTickCount64();
+        if(!g_target.pid){
+            // Cheap path: top-level windows only. This catches normal Minecraft/Pulse/Java launches.
+            if(now-lastFastSearch>=700){lastFastSearch=now;GatherCandidates(FALSE);if(g_target.pid)ResetBridgeAttempts();}
+            // Full process snapshot is only a rare fallback for custom-title clients.
+            if(!g_target.pid&&now-lastDeepSearch>=5000){lastDeepSearch=now;GatherCandidates(TRUE);if(g_target.pid)ResetBridgeAttempts();}
+        }else if(now-lastIdentity>=1800){
+            lastIdentity=now;
+            if(!FastTargetAlive()){
+                memset(&g_target,0,sizeof(g_target));g_targetHostMode=HOST_NONE;g_targetNeedsGameTitle=FALSE;g_targetTitleMisses=0;g_bridgePidHint=0;g_bridgeCreateHint=0;
+                if(!g_bridgeAttachBusy)BridgeClose();ResetBridgeAttempts();lastFastSearch=0;lastDeepSearch=0;
+            }
+        }
+
+        BOOL active=(g_target.pid&&GameForeground());
+        if(!g_cfg.triggerEnabled){Sleep(180);continue;}
+
+        if(!active){
+            // Keep attach asynchronous, but never poll Minecraft state while the game is not foreground.
+            if(g_target.pid&&now-lastIdleAttach>=1000){lastIdleAttach=now;BridgeEnsure();}
+            Sleep(100);continue;
+        }
+
+        // v28: fast target sampling for short flicks. BridgePoll exits early before heavy crit fields unless an attack is near-ready.
+        BridgePoll();TriggerTick();Sleep(16);
+    }
+    return 0;
+}
+static LRESULT CALLBACK HudProc(HWND h,UINT m,WPARAM w,LPARAM l){if(m==WM_ERASEBKGND)return 1;if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintHudBuffered(dc,ps.rcPaint);EndPaint(h,&ps);return 0;}return DefWindowProcW(h,m,w,l);}
+static DWORD WINAPI MenuHotkeyWorker(LPVOID){
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+    BOOL down=FALSE;
+    while(!g_hotkeyStop){
+        BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
+        if(kd&&!down&&g_main)SendMessageW(g_main,WM_MONO_TOGGLE,0,0);
+        down=kd;Sleep(16);
+    }
+    return 0;
+}
+static LRESULT CALLBACK MainProc(HWND h,UINT m,WPARAM w,LPARAM l){
+ if(m==WM_ERASEBKGND)return 1;
+ if(m==WM_PAINT){PAINTSTRUCT ps;HDC dc=BeginPaint(h,&ps);PaintMainBuffered(dc);EndPaint(h,&ps);return 0;}
+ if(m==WM_TIMER){
+    // UI-timer polling is a backup for the dedicated global RSHIFT worker.
+    // ToggleMenuReliable debounces both paths so one press cannot toggle twice.
+    BOOL kd=(GetAsyncKeyState(VK_RSHIFT)&0x8000)?TRUE:FALSE;
+    if(kd&&!g_rshiftDown)ToggleMenuReliable();
+    g_rshiftDown=kd;TickMenuAnimation();
+    static ULONGLONG lastMenuStatus=0,lastHud=0,lastGeom=0;ULONGLONG now=GetTickCount64();
+    BOOL animating=(g_menuAnim!=g_menuAnimTarget);
+    UINT wantTimer=animating?16:100;if(wantTimer!=g_uiTimerMs){g_uiTimerMs=wantTimer;SetTimer(h,1,g_uiTimerMs,0);}
+    if(g_menuVisible&&animating)InvalidateRect(g_main,0,FALSE);
+    else if(g_menuVisible&&now-lastMenuStatus>=1000){lastMenuStatus=now;InvalidateRect(g_main,0,FALSE);}
+    if(now-lastGeom>=1000){lastGeom=now;UpdateOverlayGeometry();}
+    if(g_cfg.showHud&&now-lastHud>=1000){lastHud=now;RequestStatusRedraw();}
+    return 0;
+ }
+ if(m==WM_MONO_TOGGLE){ToggleMenuReliable();return 0;}
+ if(m==WM_KEYDOWN&&w==VK_ESCAPE){if(g_menuVisible&&g_menuAnimTarget>0)CloseMenuReliable();return 0;}
+ if(m==WM_RBUTTONDOWN){int x,y;MapMouseToDesign(h,l,&x,&y);int cy=y+g_scroll[g_tab];if(g_tab==0&&x>=228&&x<=870&&cy>=154&&cy<=564){g_triggerExpanded=!g_triggerExpanded;ClampScroll();InvalidateRect(h,0,FALSE);return 0;}}
+ if(m==WM_MOUSEWHEEL){int d=(short)((w>>16)&0xffff);g_scroll[g_tab]+=(d<0?52:-52);ClampScroll();InvalidateRect(h,0,FALSE);return 0;}
+ if(m==WM_LBUTTONDOWN){
+    if(g_menuAnim!=1000||g_menuAnimTarget!=1000)return 0;
+    int x,y;MapMouseToDesign(h,l,&x,&y);
+    if(g_exitConfirm){if(x>=232&&x<=436&&y>=334&&y<=382){g_exitConfirm=FALSE;InvalidateRect(h,0,FALSE);return 0;}if(x>=464&&x<=668&&y>=334&&y<=382){PostQuitMessage(0);return 0;}return 0;}
+    if(y<70&&x<830){RememberMenuCenter();ReleaseCapture();SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;}
+    if(x>=842&&y>=8&&y<=58){g_exitConfirm=TRUE;InvalidateRect(h,0,FALSE);return 0;}
+    for(int i=0;i<3;i++){int ty=106+i*50;if(x>=34&&x<=186&&y>=ty&&y<=ty+38){g_tab=i;ClampScroll();InvalidateRect(h,0,FALSE);return 0;}}
+    int cy=y+g_scroll[g_tab];
+    if(g_tab==0){
+        if(x>=785&&x<=855&&cy>=165&&cy<=212){g_cfg.triggerEnabled=!g_cfg.triggerEnabled;SaveConfig();InvalidateRect(h,0,FALSE);return 0;}
+        if(g_triggerExpanded){int ys[5]={235,277,319,361,403};int* vv[5]={&g_cfg.criticalOnly,&g_cfg.hitPlayers,&g_cfg.hitMobs,&g_cfg.useSword,&g_cfg.useMace};for(int i=0;i<5;i++)if(x>=500&&x<548&&cy>=ys[i]-3&&cy<=ys[i]+25){*vv[i]=!*vv[i];SaveConfig();InvalidateRect(h,0,FALSE);return 0;}}
+    } else if(g_tab==1){
+        return 0;
+    } else {
+        if(x>=442&&x<=520&&cy>=382&&cy<=428){g_cfg.showHud=!g_cfg.showHud;SaveConfig();UpdateHudState();InvalidateRect(h,0,FALSE);return 0;}
+        if(x>=770&&x<=850&&cy>=382&&cy<=428){g_cfg.alwaysOnTop=!g_cfg.alwaysOnTop;SaveConfig();UpdateTopmost();InvalidateRect(h,0,FALSE);return 0;}
+        int yy[3]={207,265,323};for(int i=0;i<3;i++)if(x>=325&&x<=775&&cy>=yy[i]&&cy<=yy[i]+32){g_dragSlider=14+i;SetCapture(h);SetCustomSlider(14+i,x,334,430,0,255);return 0;}
+        if((x>=442&&x<=520&&cy>=522&&cy<=566)||(x>=770&&x<=850&&cy>=522&&cy<=566)){InvalidateRect(h,0,FALSE);return 0;}
+    }
+ }
+ if(m==WM_MOUSEMOVE&&g_dragSlider&&(GetAsyncKeyState(VK_LBUTTON)&0x8000)){int x,y;MapMouseToDesign(h,l,&x,&y);SetCustomSlider(g_dragSlider,x,334,430,0,255);return 0;}
+ if(m==WM_LBUTTONUP&&g_dragSlider){g_dragSlider=0;ReleaseCapture();SaveConfig();return 0;}
+ if(m==WM_MOVE){if(g_menuAnim==1000&&g_menuAnimTarget==1000)RememberMenuCenter();return 0;}
+ if(m==WM_SIZE){if(g_menuAnim==1000&&g_menuAnimTarget==1000){RECT r;GetClientRect(h,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(h,rg,TRUE);}return 0;}
+ if(m==WM_DESTROY){KillTimer(h,1);g_hotkeyStop=1;g_engineStop=1;ReleaseCapture();g_dragSlider=0;if(g_menuDC){SelectObject(g_menuDC,g_menuOld);DeleteObject(g_menuBmp);DeleteDC(g_menuDC);g_menuDC=0;g_menuBmp=0;}if(g_hudDC){SelectObject(g_hudDC,g_hudOld);DeleteObject(g_hudBmp);DeleteDC(g_hudDC);g_hudDC=0;g_hudBmp=0;}ClearBrushCache();if(g_fontTitle)DeleteObject(g_fontTitle);if(g_fontSub)DeleteObject(g_fontSub);if(g_fontBody)DeleteObject(g_fontBody);if(g_fontSmall)DeleteObject(g_fontSmall);if(g_fontMetric)DeleteObject(g_fontMetric);g_fontTitle=g_fontSub=g_fontBody=g_fontSmall=g_fontMetric=0;PostQuitMessage(0);return 0;}
+ return DefWindowProcW(h,m,w,l);
+}
+
+static void InitFonts(){
+    g_fontTitle=CreateFontW(-28,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI Variable Display");
+    g_fontMetric=CreateFontW(-21,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI Variable Display");
+    g_fontBody=CreateFontW(-16,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI Variable Text");
+    g_fontSub=CreateFontW(-15,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI Variable Text");
+    g_fontSmall=CreateFontW(-13,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI Variable Text");
+}
+
+extern "C" void WINAPI wWinMainCRTStartup(){
+    LoadConfig();g_cfg.seeInvisible=0;g_cfg.showNames=0;g_cfg.swordCooldownMs=625;g_cfg.maceCooldownMs=1670;InitFonts();
+    HWND fg=GetForegroundWindow(); if(fg){DWORD fp=0;GetWindowThreadProcessId(fg,&fp);if(fp && fp!=GetCurrentProcessId())g_startForegroundPid=fp;}
+    InitialDetect();
+    HINSTANCE inst=GetModuleHandleW(0); HCURSOR arrow=LoadCursorW(0,(LPCWSTR)(ULONG_PTR)32512);
+    WNDCLASSEXW wc;memset(&wc,0,sizeof(wc));wc.cbSize=sizeof(wc);wc.style=0;wc.lpfnWndProc=MainProc;wc.hInstance=inst;wc.hCursor=arrow;wc.lpszClassName=L"MonoClient.Main";RegisterClassExW(&wc);
+    WNDCLASSEXW hc;memset(&hc,0,sizeof(hc));hc.cbSize=sizeof(hc);hc.style=0;hc.lpfnWndProc=HudProc;hc.hInstance=inst;hc.hCursor=arrow;hc.lpszClassName=L"MonoClient.Hud";RegisterClassExW(&hc);
+    int sw=GetSystemMetrics(SM_CXSCREEN),sh=GetSystemMetrics(SM_CYSCREEN);g_menuCenterX=sw/2;g_menuCenterY=sh/2;int x=(sw-900)/2,y=(sh-600)/2;
+    // Start topmost for reliable first activation; hidden-state preference is restored immediately below.
+    g_main=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TOPMOST,L"MonoClient.Main",L"MonoClient | @monobrowser",WS_POPUP,x,y,900,600,0,0,inst,0);
+    if(!g_main)ExitProcess(2);SetLayeredWindowAttributes(g_main,MENU_KEY,0,LWA_ALPHA|LWA_COLORKEY);
+    g_hud=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,L"MonoClient.Hud",L"MonoClient HUD",WS_POPUP,24,24,380,110,0,0,inst,0);
+    RECT r;GetClientRect(g_main,&r);HRGN rg=CreateRoundRectRgn(0,0,r.right+1,r.bottom+1,24,24);SetWindowRgn(g_main,rg,TRUE);g_uiTimerMs=100;SetTimer(g_main,1,g_uiTimerMs,0);ShowWindow(g_main,SW_HIDE);
+    UpdateTopmost();UpdateHudState();
+    DWORD hotTid=0;g_hotkeyStop=0;g_hotkeyThread=CreateThread(0,0,MenuHotkeyWorker,0,0,&hotTid);
+    DWORD engineTid=0;g_engineStop=0;g_engineThread=CreateThread(0,0,EngineWorker,0,0,&engineTid);
+    MSG msg;while(GetMessageW(&msg,0,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);} g_hotkeyStop=1;g_engineStop=1;if(g_hotkeyThread){WaitForSingleObject(g_hotkeyThread,300);CloseHandle(g_hotkeyThread);g_hotkeyThread=0;}if(g_engineThread){WaitForSingleObject(g_engineThread,750);CloseHandle(g_engineThread);g_engineThread=0;}BridgeClose();SaveConfig();ExitProcess(0);
+}
