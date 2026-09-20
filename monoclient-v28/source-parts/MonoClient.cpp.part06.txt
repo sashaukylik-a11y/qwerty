@@ -211,5 +211,5 @@ extern "C" void WINAPI wWinMainCRTStartup(){
     UpdateTopmost();UpdateHudState();
     DWORD hotTid=0;g_hotkeyStop=0;g_hotkeyThread=CreateThread(0,0,MenuHotkeyWorker,0,0,&hotTid);
     DWORD engineTid=0;g_engineStop=0;g_engineThread=CreateThread(0,0,EngineWorker,0,0,&engineTid);
-    MSG msg;while(GetMessageW(&msg,0,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);} g_hotkeyStop=1;g_engineStop=1;if(g_hotkeyThread){WaitForSingleObject(g_hotkeyThread,300);CloseHandle(g_hotkeyThread);g_hotkeyThread=0;}if(g_engineThread){WaitForSingleObject(g_engineThread,750);CloseHandle(g_engineThread);g_engineThread=0;}BridgeClose();SaveConfig();ExitProcess(0);
+    MSG msg;while(GetMessageW(&msg,0,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);} g_hotkeyStop=1;g_engineStop=1;if(g_hotkeyThread){WaitForSingleObject(g_hotkeyThread,300);CloseHandle(g_hotkeyThread);g_hotkeyThread=0;}if(g_engineThread){WaitForSingleObject(g_engineThread,750);CloseHandle(g_engineThread);g_engineThread=0;}if(g_bridgeAttachThread){WaitForSingleObject(g_bridgeAttachThread,4000);CloseHandle(g_bridgeAttachThread);g_bridgeAttachThread=0;}BridgeClose();SaveConfig();ExitProcess(0);
 }
